@@ -219,7 +219,7 @@ MANIFEST = {
             "run": ["/bin/hidden-agenda"],
             "env": {},
             "source_url":
-                "https://github.com/Metta-AI/cogame-hidden-agenda/tree/main",
+                "https://github.com/softmax-universe/cogame-hidden-agenda/tree/main",
         },
         "replay_viewer": {"bundle": "static-replay-viewer"},
         "config_schema": CONFIG_SCHEMA,

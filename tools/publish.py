@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-REPO = "Metta-AI/cogame-hidden-agenda"
+REPO = "softmax-universe/cogame-hidden-agenda"
 BRANCH = "main"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
