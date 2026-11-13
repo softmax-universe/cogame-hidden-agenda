@@ -30,6 +30,14 @@ block extraction:
   let fenced = "```json\n{\"plan\":[{\"job\":\"guard\"}]}\n```"
   check(extractJsonObject(fenced){"plan"}.len == 1,
     "a fenced reply is extracted")
+  let bomAndBraces = "\xEF\xBB\xBF```json\n" &
+    "{\"plan\":[{\"job\":\"guard\"}],\"notes\":\"watch \\\"}\\\" and {NW}\"}\n```\n" &
+    "Extra note mentioning {\"job\":\"hold\"} and stray }."
+  let extracted = extractJsonObject(bomAndBraces)
+  check(extracted{"plan"}.len == 1,
+    "BOM, fences, string braces, and trailing {braces} stop at the first object")
+  check(extracted{"notes"}.getStr() == "watch \"}\" and {NW}",
+    "string-internal braces and escaped quotes survive balanced extraction")
   let prose = "Sure! Here is my plan.\n{\"plan\":[{\"job\":\"hold\"}]}\nHope " &
     "that helps."
   check(extractJsonObject(prose){"plan"}.len == 1,
@@ -40,6 +48,12 @@ block extraction:
   except CatchableError:
     raised = true
   check(raised, "a reply with no object at all raises")
+  var unbalanced = false
+  try:
+    discard extractJsonObject("{\"plan\":[{\"job\":\"hold\"}]")
+  except CatchableError:
+    unbalanced = true
+  check(unbalanced, "an unbalanced JSON object raises")
 
 block schema:
   var sim = rig()
@@ -146,6 +160,20 @@ block theCompactJobFormTheSystemPromptTeachesIsHonoured:
   ## The other half of the fix: the reply schema in the prompt now spells the
   ## sibling keys, so the model is never left to guess from `{"job":...}`.
   let hint = userPrompt(sim, 0, "", "opening")
+  check("top-level keys are ONLY plan, hunch, notes" in hint,
+    "opening prompt forbids top-level step keys")
+  check("put \"job\", \"at\", \"who\", and \"room\" ONLY inside \"plan\" step objects" in hint,
+    "prompt explicitly keeps step keys inside plan")
+  var meetingNoTalk = rig("hidden-agenda-notalk")
+  meetingNoTalk.openMeetingForTest(mcCadence)
+  check("top-level keys are ONLY plan, vote, switch, hunch, notes" in
+    userPrompt(meetingNoTalk, 0, "", "meeting"),
+    "no-talk meeting prompt lists exact meeting top-level keys")
+  var meetingTalk = rig("hidden-agenda")
+  meetingTalk.openMeetingForTest(mcCadence)
+  check("top-level keys are ONLY plan, vote, switch, say, hunch, notes" in
+    userPrompt(meetingTalk, 0, "", "meeting"),
+    "chat meeting prompt lists say among top-level keys")
   check("{\"job\":\"mine\",\"at\":\"S2\"}" in hint,
     "the schema hint spells mine's sibling key")
   check("{\"job\":\"patrol\",\"room\":\"NW\"}" in hint, "and patrol's")
