@@ -28,9 +28,9 @@ const
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
   RetryHint = "\nYour previous reply was invalid. Respond with ONLY the " &
-    "requested JSON object, using one of the listed job names, a seam id " &
-    "from the list, an alias that is active right now, and a vote that is " &
-    "an active alias or the word skip."
+    "requested JSON object, putting every {\"job\":...} step inside the " &
+    "\"plan\" array (never at top level), using a listed job name, a seam id " &
+    "from the list, an active alias, and a vote that is an active alias or skip."
 
 type
   LlmTransport = enum
@@ -605,8 +605,17 @@ proc userPrompt*(sim: Sim, slot: int, prompt, cause: string): string =
       "\"say\":\"<=" & $MaxSayLen & " chars\", " else: "") &
     "\"hunch\":\"<=" & $MaxHunchLen & " chars\", \"notes\":\"<=" &
     $MaxNotesLen & " chars\"}")
+  let topKeys =
+    if sim.inMeeting and sim.config.chat:
+      "plan, vote, switch, say, hunch, notes"
+    elif sim.inMeeting:
+      "plan, vote, switch, hunch, notes"
+    else:
+      "plan, hunch, notes"
+  lines.add("  top-level keys are ONLY " & topKeys &
+    " \u2014 put \"job\", \"at\", \"who\", and \"room\" ONLY inside \"plan\" step objects, never at top level.")
   lines.add("  plan: 1.." & $sim.config.planSteps & " steps; each <step> is " &
-    "ONE object whose argument is a SIBLING key of \"job\", never inside it:")
+    "ONE object inside \"plan\":[...] whose argument is a SIBLING key of \"job\":")
   ## The `who` example names a cog that is active RIGHT NOW and is not this
   ## seat, so a model that copies the shape verbatim still passes validation.
   var whoExample = Aliases[(slot + 1) mod Seats]
@@ -636,15 +645,55 @@ proc userPrompt*(sim: Sim, slot: int, prompt, cause: string): string =
 # ---------------------------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    let head = oneLine(text, 160)
+  ## Pulls the first balanced {...} object out of a model response, tolerating
+  ## a UTF-8 BOM, markdown fences, and trailing prose containing braces.
+  var body = strutils.strip(text)
+  if body.len >= 3 and body[0 .. 2] == "\xEF\xBB\xBF":
+    body = strutils.strip(body[3 .. ^1])
+  if body.startsWith("```"):
+    let firstBreak = body.find('\n')
+    if firstBreak >= 0:
+      body = body[firstBreak + 1 .. ^1]
+    else:
+      body = body[3 .. ^1]
+    let closing = body.rfind("```")
+    if closing >= 0:
+      body = body[0 ..< closing]
+    body = strutils.strip(body)
+  let start = body.find('{')
+  if start < 0:
+    let head = oneLine(body, 160)
     raise newException(HiddenAgendaError,
       "no JSON object in response: " & head)
-  parseJson(text[start .. stop])
+  var depth = 0
+  var inString = false
+  var escaped = false
+  var stop = -1
+  for index in start ..< body.len:
+    let ch = body[index]
+    if inString:
+      if escaped:
+        escaped = false
+      elif ch == '\\':
+        escaped = true
+      elif ch == '"':
+        inString = false
+      continue
+    case ch
+    of '"': inString = true
+    of '{': depth += 1
+    of '}':
+      depth -= 1
+      if depth == 0:
+        stop = index
+    else: discard
+    if stop >= 0:
+      break
+  if stop < 0:
+    let head = oneLine(body, 160)
+    raise newException(HiddenAgendaError,
+      "unbalanced JSON object in response: " & head)
+  parseJson(body[start .. stop])
 
 proc splitCompactJob(text: string): tuple[job, arg: string] =
   ## `"mine at:S2"` -> `("mine", "S2")`. The system prompt documents exactly
