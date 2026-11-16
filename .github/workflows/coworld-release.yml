@@ -1,7 +1,8 @@
 # Build -> certify -> upload policies -> upload coworld.
 #
 # Goes to:  .github/workflows/coworld-release.yml  in the coworld repo.
-# Substitute: hidden-agenda  (lowercase game slug; also the Coworld name and the
+# Substitute: hidden_agenda  (lowercase game slug; also the Coworld name and the
+#                      e.g. bullwhip)
 #             coworld-hidden-agenda (local image name WITHOUT a tag, must match compose.yaml
 #                      minus ":latest", e.g. coworld-bullwhip)
 #
@@ -12,12 +13,11 @@
 # not "upload-coworld prunes the image" -- no prune/rmi exists anywhere in the
 # CLI; only the ordering is established, so treat it as empirical.)
 #
-# Repo secrets required: SOFTMAX_TOKEN (set by coworld-builder's propagate-secrets.yml).
+# Repo secret required: SOFTMAX_TOKEN.
 #
 # The agent reads the outcome back with:
 #   gh run download <run_id> -R softmax-universe/cogame-hidden-agenda -n release-result \
 #     -D /tmp/rr && jq . /tmp/rr/release-result.json
-# Hosted inference uses the platform LLM sidecar without provider secrets.
 name: Coworld release
 
 on:
@@ -47,7 +47,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SLUG: hidden-agenda
+  SLUG: hidden_agenda
   IMAGE: coworld-hidden-agenda
   # 0.1.43 is a FLOOR, not a preference. Three independent reasons:
   # - LIVENESS_MARKER below is only emitted from 0.1.38 on
@@ -246,6 +246,8 @@ jobs:
                   for token in argv:
                       cmd += ["--run", token]
                   for key, value in (row.get("env") or {}).items():
+                      if key == "USE_BEDROCK":
+                          continue
                       cmd += ["--secret-env", f"{key}={value}"]
                   # The command is NOT echoed: --secret-env values are policy secrets.
                   print(f"::group::upload-policy {name} ({image}) as {player or 'the token owner'}",
@@ -303,6 +305,7 @@ jobs:
             dist/coworld_manifest.json \
             --timeout-seconds 900 \
             --wait-hosted-smoke \
+            --wait-certification \
             --hosted-smoke-timeout-seconds 1800 \
             2>&1 | tee "$RR/upload.log"
           rc="${PIPESTATUS[0]}"
@@ -331,6 +334,24 @@ jobs:
           if rc != 0:
               raise SystemExit(f"upload-coworld exited {rc}")
           PY
+
+      - name: Read certified canonical status
+        run: |
+          set -euo pipefail
+          cow_id="$(python3 -c 'import json,os;print(json.load(open(os.environ["RR"] + "/upload.json"))["cow_id"])')"
+          uvx --from "$COWORLD_PKG" coworld status "$cow_id" --json > "$RR/status.json"
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RR"])
+          status = json.loads((root / "status.json").read_text())
+          assert status["certification"]["certified"], "Hosted certification did not pass"
+          assert status["coworld"]["canonical"], "Certified version is not canonical"
+          upload = json.loads((root / "upload.json").read_text())
+          upload["canonical"] = "yes"
+          upload["hosted_certification"] = "passed"
+          (root / "upload.json").write_text(json.dumps(upload))
+          PYTHON
 
       - name: Assemble release-result.json
         if: always()
