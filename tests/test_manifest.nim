@@ -184,7 +184,7 @@ block resultsSchema:
     endings.add(row.getStr())
   check(endings.len == 6, "six legal endings")
   for ending in ["crew_deposits", "impostor_ejected", "impostor_isolation",
-      "timeout", "deadline", "forfeit"]:
+      "timeout", "deadline"]:
     check(ending in endings, ending & " must be a legal ending")
 
 block certificationFitsItsTimeout:

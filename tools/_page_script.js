@@ -464,7 +464,6 @@
       case 'timeout':
         headline = 'TIE \u2014 ' + (s.mt || s.mx) + ' TICKS, 0-0'; break;
       case 'deadline': headline = 'TIME'; break;
-      case 'forfeit': headline = 'FORFEIT'; break;
       default: headline = String(over.ending || '').toUpperCase(); break;
     }
     byId('ec-headline').textContent = headline;
