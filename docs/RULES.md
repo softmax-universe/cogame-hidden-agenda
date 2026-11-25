@@ -266,4 +266,5 @@ There is no partial credit for deposits.
 | active crew ≤ 1 | `complete` | `impostor_isolation` | impostor |
 | tick 3000 | `complete` | `timeout` | none |
 | the play deadline (0.6 × `episodeTimeoutSeconds` = 720 s) | `deadline` | `deadline` | none |
-| no seat connected within 120 s | `forfeit` | `forfeit` | none |
+
+An incomplete roster at startup ends the episode without player scores.

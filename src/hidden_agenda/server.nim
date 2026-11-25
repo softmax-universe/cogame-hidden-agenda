@@ -243,15 +243,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       echo "hidden-agenda: starting with ", connected, "/", shared.seats,
         " players connected"
       refreshSnapshotLocked()
-    if connected == 0:
-      ## Pre-existing rule (docs/RULES.md): no seat connected within 120 s -> forfeit.
-      let msg = "no player connected within connect timeout"
-      echo "hidden-agenda: ", msg, "; forfeiting"
-      declarePlayerFailure(0, msg)
-      gameSim.settle("forfeit", "forfeit", "none")
-      finishEpisode(runtimeConfig)
-      sleep(config.shutdownGraceSeconds * 1000)
-      quit(0)
     if noShow >= 0:
       let msg = "player slot " & $noShow & " never registered"
       echo "hidden-agenda: ", msg, "; aborting unscored"

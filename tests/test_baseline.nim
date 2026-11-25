@@ -124,7 +124,7 @@ for variant in AllVariants:
       sim.finalise()
       auditBoard(sim, label & " (final)")
       check(sim.done, label & ": the episode must settle")
-      check(sim.reason in ["complete", "deadline", "forfeit"],
+      check(sim.reason in ["complete", "deadline"],
         label & ": reason must be one of the three legal values")
       ## The impostor never freezes on cooldown: consecutive freezes are at
       ## least freezeCooldownTicks apart.

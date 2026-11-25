@@ -168,11 +168,10 @@ RESULTS_SCHEMA = {
         "meetings": {"type": "integer"},
         "ticks": {"type": "integer"},
         "reason": {"type": "string",
-                   "enum": ["complete", "deadline", "forfeit"]},
+                   "enum": ["complete", "deadline"]},
         "ending": {"type": "string",
                    "enum": ["crew_deposits", "impostor_ejected",
-                            "impostor_isolation", "timeout", "deadline",
-                            "forfeit"]},
+                            "impostor_isolation", "timeout", "deadline"]},
     },
 }
 

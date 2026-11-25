@@ -71,10 +71,7 @@ contacts nothing but S3 for the `.replay` file. No pod path serves a replay page
 
 Startup randomises the seed **before** `config.update` and waits up to
 `playerConnectTimeoutSeconds = 120` for all five sockets to connect and
-register. If no seat connects within 120 s, the episode settles as `forfeit`
-(per [RULES.md](RULES.md)); if only a subset of seats register, the missing
-seat is recorded as a player failure and the unfinished episode terminates
-unscored. Otherwise the server runs the tick loop.
+register. If any seat fails to register, the host reports the missing seat and ends the episode without scores.
 
 Shutdown, in order: `final` to all five sockets → the last global frame →
 `sleep 500 ms` → `results.json` → the replay → keep `/healthz` and `/global`

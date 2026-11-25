@@ -87,10 +87,10 @@ block endToEnd:
   for score in results{"scores"}:
     total += score.getInt()
   check(total == 0, "the scores must sum to exactly 0, got " & $total)
-  check(results{"reason"}.getStr() in ["complete", "deadline", "forfeit"],
+  check(results{"reason"}.getStr() in ["complete", "deadline"],
     "results.reason is one of the three legal values")
   check(results{"ending"}.getStr() in ["crew_deposits", "impostor_ejected",
-    "impostor_isolation", "timeout", "deadline", "forfeit"],
+    "impostor_isolation", "timeout", "deadline"],
     "results.ending is one of the six legal values")
   check(results{"winner"}.getStr() in ["crew", "impostor", "none"],
     "results.winner is one of the three legal values")
