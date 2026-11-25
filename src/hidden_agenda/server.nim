@@ -84,10 +84,18 @@ proc refreshSnapshotLocked() =
     except CatchableError:
       discard
 
-proc declarePlayerFailure(slot: int, message: string) =
+proc declarePlayerFailure(slot: int, message: string,
+    kind = "player_error") =
+  let safeMessage =
+    if message.strip().len > 0: cleanText(message, 2000)
+    else: "player failure"
   try:
     writeCogameEnv("COGAME_PLAYER_FAILURE_URI",
-      $(%*{"failed_policy_index": slot, "message": message}),
+      $(%*{
+        "failed_policy_index": slot,
+        "message": safeMessage,
+        "kind": kind
+      }),
       "application/json")
   except CatchableError as error:
     echo "hidden-agenda: player-failure declaration failed: ", error.msg
@@ -313,7 +321,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         raisePlayerFailure(disconnectedSeat,
           "player slot " & $disconnectedSeat & " disconnected")
       if externalBudgetError.len > 0:
-        raiseInfraFailure(externalBudgetError)
+        raiseInfraFailure(externalBudgetError, externalSeats[0])
       if internalSeats.len > 0:
         let internalDecisions = driver.decide(view, internalSeats, cause)
         for i, index in internalIndices:
@@ -373,12 +381,15 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       gameSim.runEpisode(decide, clock, playDeadlineSeconds(config), onTick)
     except PlayerFailureError as error:
       echo "hidden-agenda: player slot ", error.slot, " failed: ", error.msg
-      declarePlayerFailure(error.slot, error.msg)
+      declarePlayerFailure(error.slot, error.msg, "player_error")
       abortEpisode(runtimeConfig,
         "player failure (slot " & $error.slot & "): " & error.msg)
       quit(1)
     except InfraFailureError as error:
-      echo "hidden-agenda: infrastructure failure: ", error.msg
+      echo "hidden-agenda: infrastructure failure (slot ", error.slot, "): ",
+        error.msg
+      if error.slot >= 0:
+        declarePlayerFailure(error.slot, error.msg, "episode_inconclusive")
       abortEpisode(runtimeConfig, "infrastructure failure: " & error.msg)
       quit(1)
     except CatchableError as error:

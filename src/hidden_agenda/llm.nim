@@ -26,10 +26,6 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
-  RetryHint = "\nYour previous reply was invalid. Respond with ONLY the " &
-    "requested JSON object, putting every {\"job\":...} step inside the " &
-    "\"plan\" array (never at top level), using a listed job name, a seam id " &
-    "from the list, an active alias, and a vote that is an active alias or skip."
 
 type
   LlmTransport = enum
@@ -819,8 +815,10 @@ proc raisePlayerFailure*(slot: int, message: string) {.noreturn.} =
   err.slot = slot
   raise err
 
-proc raiseInfraFailure*(message: string) {.noreturn.} =
-  raise newException(InfraFailureError, message)
+proc raiseInfraFailure*(message: string, slot = -1) {.noreturn.} =
+  var err = newException(InfraFailureError, message)
+  err.slot = slot
+  raise err
 
 proc textOf*(client: LlmClient, response: Response, error, url: string):
     string =
@@ -868,10 +866,10 @@ proc decideAll*(
   selection: PromptSelection
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order. Genuine scripted seats run
-  ## deterministically; LLM seats are retried once on failure and raise
-  ## InfraFailureError (for provider/transport/credential errors) or
-  ## PlayerFailureError (for unparseable/illegal model replies) rather than
-  ## substituting a scripted fallback.
+  ## deterministically; LLM seats issue a single parallel batch without retries
+  ## and raise InfraFailureError (for provider/transport/credential errors) or
+  ## PlayerFailureError (for unparseable/illegal model replies) attributed to
+  ## the actual failing seat rather than substituting a scripted fallback.
   result = newSeq[Decision](seats.len)
   var open: seq[int]
   var lastError: array[Seats, string]
@@ -882,62 +880,56 @@ proc decideAll*(
       result[index] = scriptedDecision(sim, seat, kind, sim.inMeeting)
       result[index].source = dsScripted
     elif client == nil or client.disabled:
-      raiseInfraFailure("LLM client disabled or missing credentials")
+      raiseInfraFailure("LLM client disabled or missing credentials", seat)
     else:
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
-    var batch: RequestBatch
-    for index in open:
-      let seat = seats[index]
-      var user = userPrompt(sim, seat, prompts[seat], cause)
-      if attempt > 0:
-        user.add(RetryHint)
-      let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
-      batch.post(request.url, request.headers, request.body, $index)
-    ## ONE parallel batch for every open seat. Never a loop of single calls.
-    let started = epochTime()
-    let responses =
-      if client.sendBatch != nil:
-        client.sendBatch(batch, client.timeoutSeconds)
-      else:
-        client.curl.makeRequests(batch, client.timeoutSeconds)
-    let latency = int((epochTime() - started) * 1000.0)
-    var stillOpen: seq[int]
-    for position, index in open:
-      let seat = seats[index]
-      try:
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        var decision = parseReply(sim, seat, extractJsonObject(text))
-        decision.source = if attempt == 0: dsLlm else: dsRetry
-        decision.latencyMs = latency
-        result[index] = decision
-      except InfraFailureError as error:
-        let detail = cleanText(error.msg, MaxErrorLen)
-        lastError[seat] = detail
-        lastIsInfra[seat] = true
-        echo "hidden-agenda llm: seat ", seat, " attempt ", attempt + 1,
-          " infra failure: ", detail
-        stillOpen.add(index)
-      except CatchableError as error:
-        let detail = cleanText(error.msg, MaxErrorLen)
-        lastError[seat] = detail
-        lastIsInfra[seat] = false
-        echo "hidden-agenda llm: seat ", seat, " attempt ", attempt + 1,
-          " failed: ", detail
-        stillOpen.add(index)
-    open = stillOpen
-  if open.len > 0:
-    for index in open:
+  if open.len == 0:
+    return
+  var batch: RequestBatch
+  for index in open:
+    let seat = seats[index]
+    let user = userPrompt(sim, seat, prompts[seat], cause)
+    let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+    batch.post(request.url, request.headers, request.body, $index)
+  ## ONE parallel batch for every open seat. Never a loop of single calls.
+  let started = epochTime()
+  let responses =
+    if client.sendBatch != nil:
+      client.sendBatch(batch, client.timeoutSeconds)
+    else:
+      client.curl.makeRequests(batch, client.timeoutSeconds)
+  let latency = int((epochTime() - started) * 1000.0)
+  var failed: seq[int]
+  for position, index in open:
+    let seat = seats[index]
+    try:
+      let text = client.textOf(responses[position].response,
+        responses[position].error, batch[position].url)
+      var decision = parseReply(sim, seat, extractJsonObject(text))
+      decision.source = dsLlm
+      decision.latencyMs = latency
+      result[index] = decision
+    except InfraFailureError as error:
+      let detail = cleanText(error.msg, MaxErrorLen)
+      lastError[seat] = detail
+      lastIsInfra[seat] = true
+      echo "hidden-agenda llm: seat ", seat, " infra failure: ", detail
+      failed.add(index)
+    except CatchableError as error:
+      let detail = cleanText(error.msg, MaxErrorLen)
+      lastError[seat] = detail
+      lastIsInfra[seat] = false
+      echo "hidden-agenda llm: seat ", seat, " failed: ", detail
+      failed.add(index)
+  if failed.len > 0:
+    for index in failed:
       let seat = seats[index]
       if lastIsInfra[seat]:
         let detail =
           if lastError[seat].len > 0: lastError[seat]
           else: "LLM provider/infrastructure failure"
-        raiseInfraFailure(detail)
-    let seat = seats[open[0]]
+        raiseInfraFailure(detail, seat)
+    let seat = seats[failed[0]]
     let detail =
       if lastError[seat].len > 0: lastError[seat]
       else: "LLM decision failed"
@@ -995,19 +987,20 @@ proc decide*(driver: DecisionDriver, sim: var Sim, seats: seq[int],
   if seats.len == 0:
     return @[]
   result = newSeq[Decision](seats.len)
-  var hasModelSeat = false
+  var firstModelSeat = -1
   for seat in seats:
     if driver.scriptedKinds[seat] == skNone:
-      hasModelSeat = true
+      firstModelSeat = seat
       break
   if driver.batches >= driver.maxBatches or driver.pastDeadline():
     if driver.pastDeadline():
       driver.deadlineHit = true
-    if hasModelSeat:
+    if firstModelSeat >= 0:
       if driver.pastDeadline():
-        raiseInfraFailure("play deadline reached at decision point")
+        raiseInfraFailure("play deadline reached at decision point",
+          firstModelSeat)
       raiseInfraFailure("decision batch limit (" & $driver.maxBatches &
-        ") reached before episode completed")
+        ") reached before episode completed", firstModelSeat)
     for index, seat in seats:
       result[index] = scriptedDecision(sim, seat, driver.scriptedKinds[seat],
         sim.inMeeting)
