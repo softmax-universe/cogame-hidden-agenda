@@ -405,12 +405,10 @@ block frozenAndEjectedSeatsAreToldTheyCannotAct:
   check(1 notin seats and 2 notin seats,
     "the flags agree with activeSeats()")
 
-block theRetryBatchAndTheFallbackAreDriven:
-  ## Every driver block above constructs a client with no credentials, which
-  ## short-circuits to the scripted fallback BEFORE the batch loop -- so
-  ## nothing exercised the retry batch, dsRetry was never produced anywhere,
-  ## and the transport ladder (timeout, 429, 403, junk) was untested.
-  ## `stubbedLlmClient` installs a batch sender in place of curl.
+block singleAttemptFailureAttributionIsDriven:
+  ## `stubbedLlmClient` installs a batch sender in place of curl so we verify
+  ## single-attempt (no retry) behavior and exact failing-seat attribution for
+  ## both provider/transport errors and malformed model replies.
 
   proc reply(text: string): Response =
     Response(code: 200, body: $(%*{
@@ -420,20 +418,16 @@ block theRetryBatchAndTheFallbackAreDriven:
 
   let good = """{"plan":[{"job":"guard"}],"vote":"skip"}"""
 
-  ## (1) A transport error on the first batch, a good reply on the second:
-  ## the seat is retried ONCE, inside the same decision point, and the
-  ## decision is recorded as "retry" so phase 60 can count it.
+  ## (1) A transport error on seat 2 fails immediately with one batch and
+  ## attributes InfraFailureError to seat 2 (never retried, never seat 0).
   block:
     var sim = rig()
     var batches = 0
-    var sawHint = false
     proc send(batch: RequestBatch, timeoutSeconds: int):
         ResponseBatch {.closure.} =
       batches.inc
       for i in 0 ..< batch.len:
-        if "Your previous reply was invalid" in batch[i].body:
-          sawHint = true
-        if batches == 1:
+        if batch[i].tag == "2":
           result.add((Response(), "connection timed out"))
         else:
           result.add((reply(good), ""))
@@ -444,18 +438,17 @@ block theRetryBatchAndTheFallbackAreDriven:
       prompts.add("play well")
       kinds.add(skNone)
     let seats = sim.activeSeats()
-    let decisions = client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
-    check(batches == 2, "a first-attempt failure issues exactly ONE more " &
-      "batch, got " & $batches)
-    check(sawHint, "and the retry batch carries the retry hint")
-    check(decisions.len == seats.len, "one decision per seat")
-    for decision in decisions:
-      check(decision.source == dsRetry,
-        "a decision won on the second attempt is recorded as retry, got " &
-        $decision.source)
-      check(decision.plan.len >= 1, "and is a legal plan")
+    var failedSlot = -1
+    try:
+      discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
+    except InfraFailureError as err:
+      failedSlot = err.slot
+    check(batches == 1, "a transport error must not retry, got " & $batches)
+    check(failedSlot == 2,
+      "transport error attributes InfraFailureError to actual seat 2, got " &
+      $failedSlot)
 
-  ## (2) A 429 on both attempts: two batches, then InfraFailureError (no fallback, no player blame).
+  ## (2) A 429 fails immediately in one batch with InfraFailureError on the actual seat.
   block:
     var sim = rig()
     var batches = 0
@@ -471,15 +464,14 @@ block theRetryBatchAndTheFallbackAreDriven:
       prompts.add("play well")
       kinds.add(skNone)
     let seats = sim.activeSeats()
-    var infraRaised = false
+    var failedSlot = -1
     try:
       discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
-    except InfraFailureError:
-      infraRaised = true
-    check(batches == 2, "a 429 is retried once and then fails, got " &
-      $batches & " batches")
-    check(infraRaised,
-      "exhausted 429 raises InfraFailureError instead of blaming a player or falling back")
+    except InfraFailureError as err:
+      failedSlot = err.slot
+    check(batches == 1, "a 429 must not retry, got " & $batches & " batches")
+    check(failedSlot == 0,
+      "429 raises InfraFailureError for seat 0, got " & $failedSlot)
 
   ## (3) A 403 disables the client outright: one batch, raises InfraFailureError,
   ## and every LATER decision point also fails immediately without issuing a batch.
@@ -498,23 +490,23 @@ block theRetryBatchAndTheFallbackAreDriven:
       prompts.add("play well")
       kinds.add(skNone)
     let seats = sim.activeSeats()
-    var infraRaised = false
+    var failedSlot = -1
     try:
       discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
-    except InfraFailureError:
-      infraRaised = true
-    check(batches == 1, "a 403 stops the ladder inside the first batch")
+    except InfraFailureError as err:
+      failedSlot = err.slot
+    check(batches == 1, "a 403 stops inside the first batch")
     check(client.disabled, "and disables the client")
-    check(infraRaised, "and raises InfraFailureError")
-    infraRaised = false
+    check(failedSlot == 0, "and raises InfraFailureError on seat 0")
+    failedSlot = -1
     try:
       discard client.decideAll(sim, seats, prompts, kinds, "meeting", PromptSelection())
-    except InfraFailureError:
-      infraRaised = true
+    except InfraFailureError as err:
+      failedSlot = err.slot
     check(batches == 1, "a disabled client never issues another batch")
-    check(infraRaised, "and raises InfraFailureError on later calls")
+    check(failedSlot == 0, "and raises InfraFailureError on later calls")
 
-  ## (4) Junk that is not JSON at all, twice: two batches, then PlayerFailureError.
+  ## (4) Junk on seat 3: one batch (no retry), then PlayerFailureError on seat 3.
   block:
     var sim = rig()
     var batches = 0
@@ -522,7 +514,10 @@ block theRetryBatchAndTheFallbackAreDriven:
         ResponseBatch {.closure.} =
       batches.inc
       for i in 0 ..< batch.len:
-        result.add((reply("I would rather not say."), ""))
+        if batch[i].tag == "3":
+          result.add((reply("I would rather not say."), ""))
+        else:
+          result.add((reply(good), ""))
     let client = stubbedLlmClient(send)
     var prompts: seq[string]
     var kinds: seq[ScriptKind]
@@ -535,39 +530,10 @@ block theRetryBatchAndTheFallbackAreDriven:
       discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
     except PlayerFailureError as err:
       failedSlot = err.slot
-    check(batches == 2, "junk is retried once")
-    check(failedSlot == 0,
-      "and then raises PlayerFailureError instead of falling back")
-
-  ## (5) A seat that answers on the first attempt is NOT in the retry batch:
-  ## only the seats that failed are retried.
-  block:
-    var sim = rig()
-    var sizes: seq[int]
-    proc send(batch: RequestBatch, timeoutSeconds: int):
-        ResponseBatch {.closure.} =
-      sizes.add(batch.len)
-      for i in 0 ..< batch.len:
-        ## Tag is the index into `seats`; seat 0 answers immediately.
-        if batch[i].tag == "0" or sizes.len > 1:
-          result.add((reply(good), ""))
-        else:
-          result.add((Response(), "connection reset"))
-    let client = stubbedLlmClient(send)
-    var prompts: seq[string]
-    var kinds: seq[ScriptKind]
-    for _ in 0 ..< Seats:
-      prompts.add("play well")
-      kinds.add(skNone)
-    let seats = sim.activeSeats()
-    let decisions = client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
-    check(sizes == @[Seats, Seats - 1],
-      "the retry batch carries only the seats that failed, got " & $sizes)
-    check(decisions[0].source == dsLlm,
-      "the seat that answered first time is recorded as llm")
-    for index in 1 ..< decisions.len:
-      check(decisions[index].source == dsRetry,
-        "and the rest as retry")
+    check(batches == 1, "junk must not be retried, got " & $batches)
+    check(failedSlot == 3,
+      "junk raises PlayerFailureError on actual failing seat 3, got " &
+      $failedSlot)
 
 
 echo "test_llm: ok"

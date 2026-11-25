@@ -70,6 +70,7 @@ type
   PlayerFailureError* = object of HiddenAgendaError
     slot*: int
   InfraFailureError* = object of HiddenAgendaError
+    slot*: int
 
   Facing* = enum
     fN = "N", fE = "E", fS = "S", fW = "W"

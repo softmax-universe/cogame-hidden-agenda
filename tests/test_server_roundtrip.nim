@@ -1,12 +1,15 @@
 ## End-to-end public host + player round-trip tests covering:
 ## 1. Regular bare JSON and Markdown-fenced JSON from a native model seat
 ##    actually executing through the real server and producing scored results.
-## 2. Invalid / ambiguous multi-object model output recording a player failure
-##    (COGAME_PLAYER_FAILURE_URI) and terminating unscored without results.json.
-## 3. Provider HTTP failure (503) terminating unscored without results.json and
-##    without blaming a player seat in COGAME_PLAYER_FAILURE_URI.
-## 4. Missing LLM credentials terminating unscored without results.json and
-##    without blaming a player seat.
+## 2. Invalid / ambiguous multi-object model output recording a player_error
+##    (COGAME_PLAYER_FAILURE_URI) without retrying and terminating unscored
+##    without results.json.
+## 3. Provider HTTP failure (503) recording episode_inconclusive
+##    (COGAME_PLAYER_FAILURE_URI) for the interrupted seat without retrying and
+##    terminating unscored without results.json.
+## 4. Missing LLM credentials recording episode_inconclusive
+##    (COGAME_PLAYER_FAILURE_URI) for the interrupted seat and terminating
+##    unscored without results.json.
 
 import std/[os, osproc, strutils]
 
@@ -225,33 +228,42 @@ assert seat0_orders[0]["plan"][0]["job"] == "mine" and seat0_orders[0]["plan"][0
 assert seat0_orders[1]["plan"][0]["job"] == "guard"
 print("roundtrip 1 (bare + fenced JSON): ok")
 
-# 2. Invalid/ambiguous multi-object response -> player failure, unscored (no results.json)
+# 2. Invalid/ambiguous multi-object response -> player_error, no retry, unscored (no results.json)
 ambig = run_scenario("ambiguous", "ambiguous")
 assert ambig["rc"] != 0, f"ambiguous scenario must exit non-zero\n{ambig['stdout']}"
 assert ambig["results"] is None, f"ambiguous failure must not write numeric results: {ambig['results']}"
 assert ambig["replay"] is None, "ambiguous failure must not write authoritative replay"
 assert ambig["failure"] is not None, "ambiguous failure must write player_failure.json"
+assert set(ambig["failure"].keys()) == {"failed_policy_index", "message", "kind"}, f"unexpected keys: {ambig['failure']}"
 assert ambig["failure"]["failed_policy_index"] == 0, f"expected slot 0 failure: {ambig['failure']}"
-assert len(ambig["calls"]) == 2, f"expected 1 initial + 1 retry call, got {len(ambig['calls'])}"
+assert ambig["failure"]["kind"] == "player_error", f"expected player_error kind: {ambig['failure']}"
+assert len(ambig["calls"]) == 1, f"expected 1 call without retry, got {len(ambig['calls'])}"
 print("roundtrip 2 (ambiguous multi-object): ok")
 
-# 3. Provider HTTP 503 failure -> infra failure, unscored, NO player blame
+# 3. Provider HTTP 503 failure -> episode_inconclusive, no retry, unscored
 prov = run_scenario("provider_503", "provider_503")
 assert prov["rc"] != 0, f"provider 503 scenario must exit non-zero\n{prov['stdout']}"
 assert prov["results"] is None, f"provider failure must not write numeric results: {prov['results']}"
 assert prov["replay"] is None, "provider failure must not write authoritative replay"
-assert prov["failure"] is None, f"provider failure must NOT blame a player seat: {prov['failure']}"
+assert prov["failure"] is not None, "provider 503 must write player_failure.json with episode_inconclusive"
+assert set(prov["failure"].keys()) == {"failed_policy_index", "message", "kind"}, f"unexpected keys: {prov['failure']}"
+assert prov["failure"]["failed_policy_index"] == 0, f"expected interrupted slot 0: {prov['failure']}"
+assert prov["failure"]["kind"] == "episode_inconclusive", f"expected episode_inconclusive kind: {prov['failure']}"
+assert len(prov["calls"]) == 1, f"expected 1 call without retry, got {len(prov['calls'])}"
 assert prov["log"] is not None and "infrastructure failure" in prov["log"], f"missing infra log: {prov['log']}"
-print("roundtrip 3 (provider 503 infra failure): ok")
+print("roundtrip 3 (provider 503 episode_inconclusive): ok")
 
-# 4. Missing credentials -> infra failure, unscored, NO player blame
+# 4. Missing credentials -> episode_inconclusive, unscored
 creds = run_scenario("missing_creds", "missing_creds")
 assert creds["rc"] != 0, f"missing creds scenario must exit non-zero\n{creds['stdout']}"
 assert creds["results"] is None, f"missing creds must not write numeric results: {creds['results']}"
 assert creds["replay"] is None, "missing creds must not write authoritative replay"
-assert creds["failure"] is None, f"missing creds must NOT blame a player seat: {creds['failure']}"
+assert creds["failure"] is not None, "missing creds must write player_failure.json with episode_inconclusive"
+assert set(creds["failure"].keys()) == {"failed_policy_index", "message", "kind"}, f"unexpected keys: {creds['failure']}"
+assert creds["failure"]["failed_policy_index"] == 0, f"expected interrupted slot 0: {creds['failure']}"
+assert creds["failure"]["kind"] == "episode_inconclusive", f"expected episode_inconclusive kind: {creds['failure']}"
 assert creds["log"] is not None and "infrastructure failure" in creds["log"], f"missing infra log: {creds['log']}"
-print("roundtrip 4 (missing credentials infra failure): ok")
+print("roundtrip 4 (missing credentials episode_inconclusive): ok")
 """
 
 proc mustRun(cmd: string) =

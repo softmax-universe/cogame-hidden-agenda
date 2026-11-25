@@ -113,13 +113,14 @@ Extra keys are ignored. Truncation is on **rune** boundaries. Each plan step
 must place its argument (`at`, `who`, `room`) in the sibling JSON key alongside
 `"job"`.
 
-An invalid prompt-policy reply is retried **once** in the same decision point's
-batch with a hint. Still failing — or an invalid/missing external action —
-records a player failure (`COGAME_PLAYER_FAILURE_URI`) and terminates the
-unfinished episode unscored without writing authoritative `results.json` scores.
-Provider or infrastructure failures (missing credentials, HTTP 401/403/429/5xx,
-transport errors, or decision budget exhaustion) likewise terminate the
-unfinished episode unscored without attributing blame to a player seat.
+An invalid prompt-policy reply or an invalid/missing external action is not
+retried: it records a `player_error` failure (`COGAME_PLAYER_FAILURE_URI`) for
+the failing seat and terminates the unfinished episode unscored without writing
+authoritative `results.json` scores. Provider or infrastructure failures
+(missing credentials, HTTP 401/403/429/5xx, transport errors, or decision
+budget exhaustion) are not retried either: they record an `episode_inconclusive`
+failure (`COGAME_PLAYER_FAILURE_URI`) for the interrupted seat and terminate
+the unfinished episode unscored without writing `results.json`.
 
 ## The scripted baselines
 
