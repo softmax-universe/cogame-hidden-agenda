@@ -12,10 +12,9 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With none of them the client disables itself on the first discovery, every
-## decision falls back instantly with no network wait, and offline
-## certification still completes deterministically. That fallback is
-## load-bearing.
+## With none of them the client disables itself on the first discovery; genuine
+## scripted seats still run deterministically, while prompt seats fail cleanly
+## instead of silently substituting scripted moves.
 
 import std/[json, os, strutils, times]
 import bitworld/runtime
@@ -146,7 +145,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "hidden-agenda llm: no LLM credentials; every seat plays scripted"
+    echo "hidden-agenda llm: no LLM credentials; prompt seats will fail"
 
 # ---------------------------------------------------------------------------
 # The observation. Every number here is visible to that seat; NOTHING else is.
@@ -443,17 +442,17 @@ HOW YOU ACT. You do NOT drive the cog tick by tick. You choose up to """ &
     $sim.config.planSteps & """ JOBS and a deterministic kernel walks them for
 you, tick by tick, until the next meeting. Jobs for you: """ &
     jobList(cog.role) & """.
-  mine at:<seam>   walk to that seam and mine until your hands are full
-  deposit          walk to the grate and drop what you carry
-  watch who:<cog>  stand 3-5 cells away and keep your cone on that cog
-  patrol room:<r>  sweep a room's four corners looking for bodies
-  guard            stand on the grate sweeping your cone, auditing the counter
-  hold             stand still""")
+  {"job":"mine","at":"<seam>"}   walk to that seam and mine until your hands are full
+  {"job":"deposit"}              walk to the grate and drop what you carry
+  {"job":"watch","who":"<cog>"}  stand 3-5 cells away and keep your cone on that cog
+  {"job":"patrol","room":"<r>"}  sweep a room's four corners looking for bodies
+  {"job":"guard"}                stand on the grate sweeping your cone, auditing the counter
+  {"job":"hold"}                 stand still""")
   if cog.role == rImpostor:
     result.add("""
-  hunt who:<cog>   close and fire only when your own view is empty
-  strike who:<cog> close and fire the instant it is legal, witnesses or not
-  lurk room:<r>    wait in a room's far corner facing the doorway""")
+  {"job":"hunt","who":"<cog>"}   close and fire only when your own view is empty
+  {"job":"strike","who":"<cog>"} close and fire the instant it is legal, witnesses or not
+  {"job":"lurk","room":"<r>"}    wait in a room's far corner facing the doorway""")
   result.add("""
 
 The other four seats are different policies deciding SIMULTANEOUSLY: nobody
@@ -465,8 +464,7 @@ sees your plan, your vote or your line before submitting their own. Your
   result.add("""
 
 OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis, no
-explanation, no markdown fences, no text before or after the object. Your reply
-must begin with the character { and end with }.""")
+explanation, no text before or after the object.""")
 
 proc pad(text: string, width: int): string =
   result = text
@@ -641,78 +639,60 @@ proc userPrompt*(sim: Sim, slot: int, prompt, cause: string): string =
   lines.join("\n")
 
 # ---------------------------------------------------------------------------
-# Reply parsing. Tolerant extraction, strict validation.
+# Reply parsing. Strict single-object extraction and strict schema validation.
 # ---------------------------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first balanced {...} object out of a model response, tolerating
-  ## a UTF-8 BOM, markdown fences, and trailing prose containing braces.
+  ## Extracts exactly one JSON object: either bare or inside a single ordinary
+  ## outer Markdown code fence (plain or `json`-tagged). Rejects surrounding
+  ## prose, extra JSON objects, and malformed or unsupported fences.
   var body = strutils.strip(text)
   if body.len >= 3 and body[0 .. 2] == "\xEF\xBB\xBF":
     body = strutils.strip(body[3 .. ^1])
   if body.startsWith("```"):
     let firstBreak = body.find('\n')
-    if firstBreak >= 0:
-      body = body[firstBreak + 1 .. ^1]
-    else:
-      body = body[3 .. ^1]
-    let closing = body.rfind("```")
-    if closing >= 0:
-      body = body[0 ..< closing]
-    body = strutils.strip(body)
-  let start = body.find('{')
-  if start < 0:
+    if firstBreak < 0 or not body.endsWith("```"):
+      raise newException(HiddenAgendaError,
+        "malformed markdown code fence: " & oneLine(body, 160))
+    let fenceTag = body[3 ..< firstBreak].strip().toLowerAscii()
+    if fenceTag.len > 0 and fenceTag != "json":
+      raise newException(HiddenAgendaError,
+        "unsupported markdown fence tag '" & fenceTag & "'")
+    let closingStart = body.len - 3
+    if closingStart <= firstBreak:
+      raise newException(HiddenAgendaError, "empty markdown code fence")
+    body = strutils.strip(body[firstBreak + 1 ..< closingStart])
+  if body.len == 0 or body[0] != '{':
     let head = oneLine(body, 160)
     raise newException(HiddenAgendaError,
-      "no JSON object in response: " & head)
-  var depth = 0
-  var inString = false
-  var escaped = false
-  var stop = -1
-  for index in start ..< body.len:
-    let ch = body[index]
-    if inString:
-      if escaped:
-        escaped = false
-      elif ch == '\\':
-        escaped = true
-      elif ch == '"':
-        inString = false
-      continue
-    case ch
-    of '"': inString = true
-    of '{': depth += 1
-    of '}':
-      depth -= 1
-      if depth == 0:
-        stop = index
-    else: discard
-    if stop >= 0:
-      break
-  if stop < 0:
-    let head = oneLine(body, 160)
+      "response must be a single JSON object: " & head)
+  try:
+    result = parseJson(body)
+  except JsonParsingError as error:
     raise newException(HiddenAgendaError,
-      "unbalanced JSON object in response: " & head)
-  parseJson(body[start .. stop])
+      "invalid JSON object in response: " & error.msg)
+  if result.kind != JObject:
+    raise newException(HiddenAgendaError, "response must be a JSON object")
 
-proc splitCompactJob(text: string): tuple[job, arg: string] =
-  ## `"mine at:S2"` -> `("mine", "S2")`. The system prompt documents exactly
-  ## this compact form (`mine at:<seam>`, `watch who:<cog>`, `patrol room:<r>`,
-  ## and the impostor's `hunt`/`strike`/`lurk`), so a model that writes it into
-  ## the "job" key is following our own instructions and is honoured rather
-  ## than rejected. A bare job name comes back with an empty `arg`.
-  let parts = text.splitWhitespace()
-  if parts.len == 0:
-    return ("", "")
-  result.job = parts[0]
-  if parts.len > 1:
-    let rest = parts[1 .. ^1].join(" ")
-    let colon = rest.find(':')
-    result.arg = (if colon >= 0: rest[colon + 1 .. ^1] else: rest).strip()
+proc optionalStringField(payload: JsonNode, key: string): string =
+  let node = payload{key}
+  if node == nil or node.kind == JNull:
+    return ""
+  if node.kind != JString:
+    raise newException(HiddenAgendaError, key & " must be a string or null")
+  node.getStr()
+
+proc requiredStringField(payload: JsonNode, key, context: string): string =
+  let node = payload{key}
+  if node == nil or node.kind != JString:
+    raise newException(HiddenAgendaError, context)
+  node.getStr().strip()
 
 proc parseReply*(sim: Sim, slot: int, payload: JsonNode): Decision =
-  ## Validates against the reply schema. Anything outside it is an INVALID
-  ## REPLY, which the caller retries once with the hint and then falls back.
+  ## Validates against the canonical reply schema. Anything outside it raises
+  ## HiddenAgendaError.
+  if payload == nil or payload.kind != JObject:
+    raise newException(HiddenAgendaError, "reply must be a JSON object")
   let role = sim.cogs[slot].role
   let planNode = payload{"plan"}
   if planNode == nil or planNode.kind != JArray or planNode.len == 0:
@@ -724,11 +704,8 @@ proc parseReply*(sim: Sim, slot: int, payload: JsonNode): Decision =
   for stepNode in planNode:
     if stepNode.kind != JObject:
       raise newException(HiddenAgendaError, "each plan step must be an object")
-    ## The argument is read from the sibling key first and from the compact
-    ## `job` string only when that sibling is absent; the enums are upper-case
-    ## either way, so the compact argument is case-insensitive too.
-    let (jobText, inlineArg) = splitCompactJob(
-      stepNode{"job"}.getStr().strip().toLowerAscii())
+    let jobText = requiredStringField(stepNode, "job",
+      "each plan step needs a string job").toLowerAscii()
     var job: JobKind
     var known = false
     for candidate in JobKind:
@@ -743,31 +720,29 @@ proc parseReply*(sim: Sim, slot: int, payload: JsonNode): Decision =
         "job " & jobText & " is impostor-only")
     var step = PlanStep(job: job)
     if job == jkMine:
-      step.at = stepNode{"at"}.getStr().strip().toUpperAscii()
-      if step.at.len == 0:
-        step.at = inlineArg.toUpperAscii()
+      step.at = requiredStringField(stepNode, "at",
+        "mine needs at: one of S1..S6").toUpperAscii()
       if seamIndex(step.at) < 0:
         raise newException(HiddenAgendaError,
           "mine needs at: one of S1..S6, got '" & step.at & "'")
     if job in {jkWatch, jkHunt, jkStrike}:
-      step.who = stepNode{"who"}.getStr().strip().toUpperAscii()
-      if step.who.len == 0:
-        step.who = inlineArg.toUpperAscii()
+      step.who = requiredStringField(stepNode, "who",
+        "who: must name a cog that is active right now").toUpperAscii()
       if not sim.isActiveAlias(step.who) or step.who == Aliases[slot]:
         raise newException(HiddenAgendaError,
           "who: must name a cog that is active right now, got '" &
           step.who & "'")
     if job in {jkPatrol, jkLurk}:
-      step.room = stepNode{"room"}.getStr().strip().toUpperAscii()
-      if step.room.len == 0:
-        step.room = inlineArg.toUpperAscii()
+      step.room = requiredStringField(stepNode, "room",
+        "room: must be one of NW N NE SW S SE HUB").toUpperAscii()
       if roomIndex(step.room) < 0:
         raise newException(HiddenAgendaError,
           "room: must be one of NW N NE SW S SE HUB, got '" & step.room & "'")
     result.plan.add(step)
 
   if sim.inMeeting:
-    let vote = payload{"vote"}.getStr().strip().toUpperAscii()
+    let vote = requiredStringField(payload, "vote",
+      "vote is required at a meeting").toUpperAscii()
     if vote.len == 0:
       raise newException(HiddenAgendaError, "vote is required at a meeting")
     if vote == "SKIP":
@@ -779,34 +754,30 @@ proc parseReply*(sim: Sim, slot: int, payload: JsonNode): Decision =
         "vote must be an active alias or skip, got '" & vote & "'")
     let switchNode = payload{"switch"}
     if switchNode != nil and switchNode.kind == JObject:
-      let condition = switchNode{"if"}.getStr().strip().toUpperAscii()
-      let target = switchNode{"to"}.getStr().strip().toUpperAscii()
-      ## A HALF-WRITTEN switch degrades to "no conditional" instead of
-      ## invalidating the whole reply. The design note's reply-schema table
-      ## calls a malformed switch an invalid reply, but its governing intent is
-      ## degrade-never-hang, and the strict reading is what the retry-then-
-      ## fallback cost is measured against: in the hosted league (round 2,
-      ## 2026-08-26) `switch needs both "if" and "to"` threw away a seat's
-      ## whole plan and vote over an OPTIONAL field and put it on the scripted
-      ## baseline. A switch that names an inactive cog is still invalid --
-      ## that one is a claim about the roster, not a missing key.
-      if condition.len > 0 and target.len > 0:
-        if condition != "TIE" and not sim.isActiveAlias(condition):
-          raise newException(HiddenAgendaError,
-            "switch.if must be an active alias or tie, got '" & condition & "'")
-        if target != "SKIP" and not sim.isActiveAlias(target):
-          raise newException(HiddenAgendaError,
-            "switch.to must be an active alias or skip, got '" & target & "'")
-        result.switchIf = if condition == "TIE": "tie" else: condition
-        result.switchTo = if target == "SKIP": "skip" else: target
+      let condition = requiredStringField(switchNode, "if",
+        "switch needs both \"if\" and \"to\"").toUpperAscii()
+      let target = requiredStringField(switchNode, "to",
+        "switch needs both \"if\" and \"to\"").toUpperAscii()
+      if condition.len == 0 or target.len == 0:
+        raise newException(HiddenAgendaError,
+          "switch needs both \"if\" and \"to\"")
+      if condition != "TIE" and not sim.isActiveAlias(condition):
+        raise newException(HiddenAgendaError,
+          "switch.if must be an active alias or tie, got '" & condition & "'")
+      if target != "SKIP" and not sim.isActiveAlias(target):
+        raise newException(HiddenAgendaError,
+          "switch.to must be an active alias or skip, got '" & target & "'")
+      result.switchIf = if condition == "TIE": "tie" else: condition
+      result.switchTo = if target == "SKIP": "skip" else: target
     elif switchNode != nil and switchNode.kind notin {JNull}:
       raise newException(HiddenAgendaError, "switch must be an object or null")
 
   ## `say` in a no-talk variant is IGNORED, not an error, and never recorded.
+  let sayText = optionalStringField(payload, "say")
   if sim.config.chat:
-    result.say = oneLine(payload{"say"}.getStr(), MaxSayLen)
-  result.hunch = oneLine(payload{"hunch"}.getStr(), MaxHunchLen)
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+    result.say = oneLine(sayText, MaxSayLen)
+  result.hunch = oneLine(optionalStringField(payload, "hunch"), MaxHunchLen)
+  result.notes = cleanText(optionalStringField(payload, "notes"), MaxNotesLen)
   result.source = dsLlm
 
 # ---------------------------------------------------------------------------
@@ -843,29 +814,41 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
+proc raisePlayerFailure*(slot: int, message: string) {.noreturn.} =
+  var err = newException(PlayerFailureError, message)
+  err.slot = slot
+  raise err
+
+proc raiseInfraFailure*(message: string) {.noreturn.} =
+  raise newException(InfraFailureError, message)
+
 proc textOf*(client: LlmClient, response: Response, error, url: string):
     string =
   if error.len > 0:
-    raise newException(HiddenAgendaError, "llm transport: " & error)
+    raiseInfraFailure("llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = cleanText(response.body, 200)
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(HiddenAgendaError,
-        "bedrock model access denied: " & detail)
+      raiseInfraFailure("bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(HiddenAgendaError,
+    raiseInfraFailure(
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     discard client.tryNextBedrockModel("throttled")
-    raise newException(HiddenAgendaError,
+    raiseInfraFailure(
       "llm throttled (429): " & cleanText(response.body, 200))
   if response.code < 200 or response.code >= 300:
-    raise newException(HiddenAgendaError, "anthropic error " & $response.code &
+    raiseInfraFailure("llm provider error " & $response.code &
       ": " & cleanText(response.body, 200))
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as parseErr:
+    raiseInfraFailure("invalid provider JSON response: " &
+      cleanText(parseErr.msg, 200))
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(HiddenAgendaError, "anthropic refusal")
+    raise newException(HiddenAgendaError, "model refusal")
   let content = payload{"content"}
   if content != nil and content.kind == JArray:
     for contentBlock in content:
@@ -884,19 +867,22 @@ proc decideAll*(
   cause: string,
   selection: PromptSelection
 ): seq[Decision] =
-  ## One decision per seat in `seats`, in order. NEVER raises: any failure falls
-  ## back to the `miner` decision so the episode always advances. `prompts` and
-  ## `scriptedKinds` are indexed by SEAT.
+  ## One decision per seat in `seats`, in order. Genuine scripted seats run
+  ## deterministically; LLM seats are retried once on failure and raise
+  ## InfraFailureError (for provider/transport/credential errors) or
+  ## PlayerFailureError (for unparseable/illegal model replies) rather than
+  ## substituting a scripted fallback.
   result = newSeq[Decision](seats.len)
   var open: seq[int]
+  var lastError: array[Seats, string]
+  var lastIsInfra: array[Seats, bool]
   for index, seat in seats:
     let kind = scriptedKinds[seat]
     if kind != skNone:
       result[index] = scriptedDecision(sim, seat, kind, sim.inMeeting)
       result[index].source = dsScripted
     elif client == nil or client.disabled:
-      result[index] = scriptedDecision(sim, seat, skMiner, sim.inMeeting)
-      result[index].source = dsFallback
+      raiseInfraFailure("LLM client disabled or missing credentials")
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -928,16 +914,34 @@ proc decideAll*(
         decision.source = if attempt == 0: dsLlm else: dsRetry
         decision.latencyMs = latency
         result[index] = decision
-      except CatchableError as error:
+      except InfraFailureError as error:
+        let detail = cleanText(error.msg, MaxErrorLen)
+        lastError[seat] = detail
+        lastIsInfra[seat] = true
         echo "hidden-agenda llm: seat ", seat, " attempt ", attempt + 1,
-          " failed: ", cleanText(error.msg, MaxErrorLen)
+          " infra failure: ", detail
+        stillOpen.add(index)
+      except CatchableError as error:
+        let detail = cleanText(error.msg, MaxErrorLen)
+        lastError[seat] = detail
+        lastIsInfra[seat] = false
+        echo "hidden-agenda llm: seat ", seat, " attempt ", attempt + 1,
+          " failed: ", detail
         stillOpen.add(index)
     open = stillOpen
-  for index in open:
-    let seat = seats[index]
-    echo "hidden-agenda llm: seat ", seat, " falling back to scripted decision"
-    result[index] = scriptedDecision(sim, seat, skMiner, sim.inMeeting)
-    result[index].source = dsFallback
+  if open.len > 0:
+    for index in open:
+      let seat = seats[index]
+      if lastIsInfra[seat]:
+        let detail =
+          if lastError[seat].len > 0: lastError[seat]
+          else: "LLM provider/infrastructure failure"
+        raiseInfraFailure(detail)
+    let seat = seats[open[0]]
+    let detail =
+      if lastError[seat].len > 0: lastError[seat]
+      else: "LLM decision failed"
+    raisePlayerFailure(seat, "seat " & $seat & " rejected action: " & detail)
 
 # ---------------------------------------------------------------------------
 # The decision driver: the batch cadence, the wall-clock floor, the batch cap
@@ -958,8 +962,6 @@ type
     deadline*: float
     clock*: proc (): float {.closure.}
     sleeper*: proc (seconds: float) {.closure.}
-    previous*: array[Seats, Decision]
-    hasPrevious*: array[Seats, bool]
     deadlineHit*: bool
     batchSizes*: seq[int]
 
@@ -989,20 +991,27 @@ proc pastDeadline*(driver: DecisionDriver): bool =
 
 proc decide*(driver: DecisionDriver, sim: var Sim, seats: seq[int],
     cause: string): seq[Decision] =
-  ## One batch for every eligible seat at this decision point. Never raises.
+  ## One batch for every eligible seat at this decision point.
+  if seats.len == 0:
+    return @[]
   result = newSeq[Decision](seats.len)
-  ## Budget cap: after the last permitted batch every subsequent meeting
-  ## reuses each seat's PREVIOUS decision, recorded as source "budget".
+  var hasModelSeat = false
+  for seat in seats:
+    if driver.scriptedKinds[seat] == skNone:
+      hasModelSeat = true
+      break
   if driver.batches >= driver.maxBatches or driver.pastDeadline():
     if driver.pastDeadline():
       driver.deadlineHit = true
+    if hasModelSeat:
+      if driver.pastDeadline():
+        raiseInfraFailure("play deadline reached at decision point")
+      raiseInfraFailure("decision batch limit (" & $driver.maxBatches &
+        ") reached before episode completed")
     for index, seat in seats:
-      result[index] =
-        if driver.hasPrevious[seat]:
-          driver.previous[seat]
-        else:
-          scriptedDecision(sim, seat, skMiner, sim.inMeeting)
-      result[index].source = dsBudget
+      result[index] = scriptedDecision(sim, seat, driver.scriptedKinds[seat],
+        sim.inMeeting)
+      result[index].source = dsScripted
       result[index].latencyMs = 0
     return
   ## `minBatchSeconds` floors the spacing between batch STARTS, so the episode
@@ -1019,6 +1028,3 @@ proc decide*(driver: DecisionDriver, sim: var Sim, seats: seq[int],
   driver.batchSizes.add(seats.len)
   result = decideAll(driver.client, sim, seats, driver.prompts,
     driver.scriptedKinds, cause, driver.selection)
-  for index, seat in seats:
-    driver.previous[seat] = result[index]
-    driver.hasPrevious[seat] = true

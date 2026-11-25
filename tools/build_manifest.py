@@ -217,7 +217,10 @@ MANIFEST = {
             "type": "game",
             "image": IMAGE,
             "run": ["/bin/hidden-agenda"],
-            "env": {},
+            "env": {
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+            },
             "source_url":
                 "https://github.com/softmax-universe/cogame-hidden-agenda/tree/main",
         },
@@ -244,6 +247,22 @@ MANIFEST = {
         },
     },
     "player": [
+        {
+            "id": "hidden-agenda-player",
+            "type": "player",
+            "name": "Hidden Agenda native model",
+            "description": ("Native LLM-driven player using the hosted model "
+                            "sidecar and the built-in default strategy prompt "
+                            "(or custom PLAYER_PROMPT)."),
+            "image": IMAGE,
+            "run": ["/bin/hidden-agenda-player"],
+            "env": {
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+            },
+            "resources": {"requests": {"cpu": "100m", "memory": "64Mi"},
+                          "limits": {"cpu": "1"}},
+        },
         {
             "id": "hidden-agenda-miner",
             "type": "player",
@@ -325,7 +344,7 @@ MANIFEST = {
             "players": PLAYERS,
         },
         "players": [
-            {"player_id": "hidden-agenda-miner"},
+            {"player_id": "hidden-agenda-player"},
             {"player_id": "hidden-agenda-miner"},
             {"player_id": "hidden-agenda-miner"},
             {"player_id": "hidden-agenda-miner"},

@@ -205,8 +205,6 @@ proc update*(config: var GameConfig, configJson: string) =
   intField("maxOutputTokens", config.maxOutputTokens)
   intField("episodeTimeoutSeconds", config.episodeTimeoutSeconds)
   intField("playerConnectTimeoutSeconds", config.playerConnectTimeoutSeconds)
-  intField("player_connect_timeout_seconds",
-    config.playerConnectTimeoutSeconds)
   intField("shutdownGraceSeconds", config.shutdownGraceSeconds)
   boolField("chat", config.chat)
   boolField("showPlayerLabels", config.showPlayerLabels)

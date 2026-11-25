@@ -49,8 +49,10 @@ type
     external: seq[bool]
     decisionId: int
     pendingActions: seq[JsonNode]
+    pendingErrors: seq[string]
     registered: seq[bool]
     everRegistered: seq[bool]
+    disconnected: seq[bool]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -156,6 +158,27 @@ proc broadcastFinal() =
     except CatchableError as error:
       echo "hidden-agenda: final frame to slot ", slot, " failed: ", error.msg
 
+proc abortEpisode(runtimeConfig: RuntimeConfig, message: string) =
+  withLock stateLock:
+    if shared.finished:
+      return
+    shared.finished = true
+    for _, socket in shared.playerSockets:
+      try:
+        socket.close()
+      except CatchableError:
+        discard
+    for socket in shared.globalSockets:
+      try:
+        socket.close()
+      except CatchableError:
+        discard
+  if runtimeConfig.logUri.len > 0:
+    try:
+      writeLog(runtimeConfig, message & "\n")
+    except CatchableError as error:
+      echo "hidden-agenda: failed to write failure log: ", error.msg
+
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
@@ -217,23 +240,24 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         if not shared.everRegistered[slot]:
           if noShow < 0:
             noShow = slot
-          ## A seat that never connects does NOT end the episode: it plays
-          ## `miner` and the game runs.
-          shared.scriptedKinds[slot] = skMiner
       echo "hidden-agenda: starting with ", connected, "/", shared.seats,
         " players connected"
       refreshSnapshotLocked()
-    if noShow >= 0:
-      declarePlayerFailure(noShow,
-        "player slot " & $noShow & " never registered; the seat played the " &
-        "miner baseline")
-
     if connected == 0:
-      echo "hidden-agenda: no seat connected; forfeiting"
+      ## Pre-existing rule (docs/RULES.md): no seat connected within 120 s -> forfeit.
+      let msg = "no player connected within connect timeout"
+      echo "hidden-agenda: ", msg, "; forfeiting"
+      declarePlayerFailure(0, msg)
       gameSim.settle("forfeit", "forfeit", "none")
       finishEpisode(runtimeConfig)
       sleep(config.shutdownGraceSeconds * 1000)
       quit(0)
+    if noShow >= 0:
+      let msg = "player slot " & $noShow & " never registered"
+      echo "hidden-agenda: ", msg, "; aborting unscored"
+      declarePlayerFailure(noShow, msg)
+      abortEpisode(runtimeConfig, msg)
+      quit(1)
 
     var prompts: seq[string]
     var kinds: seq[ScriptKind]
@@ -249,62 +273,127 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
     proc decide(view: var Sim, seats: seq[int], cause: string):
         seq[Decision] {.closure.} =
+      result = newSeq[Decision](seats.len)
       var external: seq[bool]
+      var internalSeats: seq[int]
+      var internalIndices: seq[int]
+      var externalSeats: seq[int]
+      var externalIndices: seq[int]
       var decisionId: int
-      var requestExternal = false
+      var disconnectedSeat = -1
+      var externalBudgetError = ""
       withLock stateLock:
         pushStateFrames(cause)
-        ## Re-read live: a seat whose socket died mid-episode has already been
-        ## demoted to `miner` by the close handler.
         driver.prompts = shared.prompts
+        driver.scriptedKinds = shared.scriptedKinds
         external = shared.external
-        driver.scriptedKinds = newSeq[ScriptKind](shared.seats)
-        for slot in 0 ..< shared.seats:
-          driver.scriptedKinds[slot] =
-            if external[slot]: skMiner else: shared.scriptedKinds[slot]
-        requestExternal = driver.batches < driver.maxBatches and
-          not driver.pastDeadline()
+        for index, seat in seats:
+          if shared.disconnected[seat] and
+              (external[seat] or shared.scriptedKinds[seat] == skNone):
+            disconnectedSeat = seat
+            break
+          if external[seat]:
+            externalSeats.add(seat)
+            externalIndices.add(index)
+          else:
+            internalSeats.add(seat)
+            internalIndices.add(index)
         shared.pendingActions = newSeq[JsonNode](shared.seats)
-        if requestExternal:
-          inc shared.decisionId
-          decisionId = shared.decisionId
-          for seat in seats:
-            if external[seat] and shared.playerSockets.hasKey(seat):
-              shared.playerSockets[seat].send($ %*{
-                "type": "observation", "id": decisionId,
-                "observation": seatView(view, seat, cause)})
-      result = driver.decide(view, seats, cause)
-      if requestExternal:
+        shared.pendingErrors = newSeq[string](shared.seats)
+        if disconnectedSeat < 0 and externalSeats.len > 0:
+          if driver.pastDeadline():
+            driver.deadlineHit = true
+            externalBudgetError = "play deadline reached at decision point"
+          elif driver.batches >= driver.maxBatches:
+            externalBudgetError = "decision batch limit (" & $driver.maxBatches &
+              ") reached before episode completed"
+          else:
+            inc shared.decisionId
+            decisionId = shared.decisionId
+            for seat in externalSeats:
+              if shared.playerSockets.hasKey(seat):
+                try:
+                  shared.playerSockets[seat].send($ %*{
+                    "type": "observation", "id": decisionId,
+                    "observation": seatView(view, seat, cause)})
+                except CatchableError:
+                  shared.disconnected[seat] = true
+      if disconnectedSeat >= 0:
+        raisePlayerFailure(disconnectedSeat,
+          "player slot " & $disconnectedSeat & " disconnected")
+      if externalBudgetError.len > 0:
+        raiseInfraFailure(externalBudgetError)
+      if internalSeats.len > 0:
+        let internalDecisions = driver.decide(view, internalSeats, cause)
+        for i, index in internalIndices:
+          result[index] = internalDecisions[i]
+      elif externalSeats.len > 0:
+        driver.batches.inc
+        driver.batchSizes.add(externalSeats.len)
+      if externalSeats.len > 0:
         let started = epochTime()
         let deadline = epochTime() + config.llmTimeoutSeconds.float
         while epochTime() < deadline:
           var ready = true
           withLock stateLock:
-            for seat in seats:
-              if external[seat] and shared.playerSockets.hasKey(seat) and
-                  shared.pendingActions[seat].isNil:
+            for seat in externalSeats:
+              if shared.pendingActions[seat].isNil and
+                  shared.pendingErrors[seat].len == 0 and
+                  not shared.disconnected[seat] and
+                  shared.playerSockets.hasKey(seat):
                 ready = false
           if ready:
             break
           sleep(20)
-        for index, seat in seats:
-          if external[seat]:
-            var action: JsonNode
-            withLock stateLock:
-              action = shared.pendingActions[seat]
-            if not action.isNil:
-              result[index] = view.parseReply(seat, action)
-              result[index].source = dsExternal
-              result[index].latencyMs = int((epochTime() - started) * 1000)
-              driver.previous[seat] = result[index]
-              driver.hasPrevious[seat] = true
+        for i, seat in externalSeats:
+          let index = externalIndices[i]
+          var action: JsonNode
+          var errMsg: string
+          var lost = false
+          withLock stateLock:
+            action = shared.pendingActions[seat]
+            errMsg = shared.pendingErrors[seat]
+            lost = shared.disconnected[seat] or
+              not shared.playerSockets.hasKey(seat)
+          if errMsg.len > 0:
+            raisePlayerFailure(seat,
+              "external player slot " & $seat & " rejected action: " & errMsg)
+          if action.isNil:
+            if lost:
+              raisePlayerFailure(seat,
+                "external player slot " & $seat & " disconnected before acting")
+            raisePlayerFailure(seat,
+              "external player slot " & $seat & " timed out without submitting an action")
+          try:
+            result[index] = view.parseReply(seat, action)
+          except CatchableError as error:
+            raisePlayerFailure(seat,
+              "external player slot " & $seat & " rejected action: " &
+              cleanText(error.msg, MaxErrorLen))
+          result[index].source = dsExternal
+          result[index].latencyMs = int((epochTime() - started) * 1000)
 
     proc onTick(view: var Sim) {.closure.} =
       if view.tick mod 24 == 0 or view.done:
         withLock stateLock:
           refreshSnapshotLocked()
 
-    gameSim.runEpisode(decide, clock, playDeadlineSeconds(config), onTick)
+    try:
+      gameSim.runEpisode(decide, clock, playDeadlineSeconds(config), onTick)
+    except PlayerFailureError as error:
+      echo "hidden-agenda: player slot ", error.slot, " failed: ", error.msg
+      declarePlayerFailure(error.slot, error.msg)
+      abortEpisode(runtimeConfig,
+        "player failure (slot " & $error.slot & "): " & error.msg)
+      quit(1)
+    except InfraFailureError as error:
+      echo "hidden-agenda: infrastructure failure: ", error.msg
+      abortEpisode(runtimeConfig, "infrastructure failure: " & error.msg)
+      quit(1)
+    except CatchableError as error:
+      echo "hidden-agenda: episode error: ", error.msg
+      abortEpisode(runtimeConfig, "episode error: " & error.msg)
+      quit(1)
     withLock stateLock:
       pushStateFrames("final")
     finishEpisode(runtimeConfig)
@@ -413,7 +502,9 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
       try:
         let payload = parseJson(message.data)
         if payload{"type"}.getStr() == "register":
-          if payload["control"].getStr() != "external":
+          let control = payload{"control"}
+          if control == nil or control.kind != JString or
+              control.getStr() != "external":
             raise newException(HiddenAgendaError, "unknown player control")
           withLock stateLock:
             shared.external[slot] = true
@@ -422,26 +513,44 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
           return
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
-            if shared.external[slot] and payload["id"].getInt() ==
-                shared.decisionId and shared.pendingActions[slot].isNil:
-              let action = payload["action"]
-              discard gameSim.parseReply(slot, action)
-              shared.pendingActions[slot] = action
+            let idNode = payload{"id"}
+            if shared.external[slot] and idNode != nil and
+                idNode.kind == JInt and idNode.getInt() == shared.decisionId and
+                shared.pendingActions[slot].isNil and
+                shared.pendingErrors[slot].len == 0:
+              let action = payload{"action"}
+              try:
+                discard gameSim.parseReply(slot, action)
+                shared.pendingActions[slot] = action
+              except CatchableError as error:
+                shared.pendingErrors[slot] = cleanText(error.msg, MaxErrorLen)
           return
         if payload{"type"}.getStr() != "prompt":
           echo "hidden-agenda: ignoring player frame of type '",
             payload{"type"}.getStr(), "'"
           return
-        var prompt = payload{"prompt"}.getStr()
+        let promptNode = payload{"prompt"}
+        if promptNode != nil and promptNode.kind notin {JNull, JString}:
+          raise newException(HiddenAgendaError, "prompt must be a string or null")
+        var prompt = if promptNode != nil and promptNode.kind == JString:
+          promptNode.getStr() else: ""
         if prompt.runeLen > MaxPromptLen:
           prompt = cleanText(prompt, MaxPromptLen)
         let node = payload{"scripted"}
-        var kind =
-          if node == nil or node.kind == JNull: skNone
-          elif node.kind == JBool: (if node.getBool(): skMiner else: skNone)
-          else: parseScriptKind(node.getStr())
+        var kind = skNone
+        if node != nil and node.kind != JNull:
+          if node.kind != JString:
+            raise newException(HiddenAgendaError,
+              "scripted must be a string or null")
+          let scriptedText = node.getStr().strip()
+          if scriptedText.len > 0:
+            kind = parseScriptKind(scriptedText)
+            if kind == skNone:
+              raise newException(HiddenAgendaError,
+                "unknown scripted baseline: " & scriptedText)
         if prompt.strip().len == 0 and kind == skNone:
-          kind = skMiner
+          raise newException(HiddenAgendaError,
+            "prompt frame must specify a prompt or scripted baseline")
         withLock stateLock:
           shared.prompts[slot] = prompt
           shared.scriptedKinds[slot] = kind
@@ -462,10 +571,8 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
           shared.socketSlots.del(websocket)
           if shared.playerSockets.getOrDefault(slot) == websocket:
             shared.playerSockets.del(slot)
-          ## A seat whose socket dies mid-episode plays `miner` for the rest
-          ## of it; the episode never blocks on a socket.
-          if shared.scriptedKinds[slot] == skNone:
-            shared.scriptedKinds[slot] = skMiner
+          if not shared.finished:
+            shared.disconnected[slot] = true
         shared.globalSockets.excl(websocket)
 
 proc buildRouter(): Router =
@@ -494,8 +601,10 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   shared.scriptedKinds = newSeq[ScriptKind](shared.seats)
   shared.external = newSeq[bool](shared.seats)
   shared.pendingActions = newSeq[JsonNode](shared.seats)
+  shared.pendingErrors = newSeq[string](shared.seats)
   shared.registered = newSeq[bool](shared.seats)
   shared.everRegistered = newSeq[bool](shared.seats)
+  shared.disconnected = newSeq[bool](shared.seats)
   shared.snapshot = globalSnapshot(gameSim)
   let router = buildRouter()
   gameServer = newServer(router, websocketHandler, workerThreads = 4)

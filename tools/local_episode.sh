@@ -25,7 +25,7 @@ config = {
     'impostorSlot': 0 if role == 'impostor' else 4,
     'chat': False, 'meetingTicks': 25, 'sayTick': -1,
     'revealTick': 5, 'switchTick': 18, 'resolveTick': 23,
-    'minBatchSeconds': 0, 'player_connect_timeout_seconds': 10,
+    'minBatchSeconds': 0, 'playerConnectTimeoutSeconds': 10,
 }
 config.update({
     'maxTicks': 100 if profile == 'smoke' else 3000,

@@ -43,6 +43,10 @@ block imagePlaceholderComesFromCompose:
 block hostedLlmNeedsNoSecret:
   doAssert game{"runnable"}{"env"}{"ANTHROPIC_API_KEY_URI"}.isNil,
     "hosted LLM uses the platform sidecar without provider secrets"
+  check(game{"runnable"}{"env"}{"COWORLD_LLM_ENABLED"}.getStr() == "true",
+    "game runnable enables the hosted LLM sidecar for server-side prompt seats")
+  check(game{"runnable"}{"env"}{"COWORLD_LLM_MODEL"}.getStr().len > 0,
+    "game runnable declares a default COWORLD_LLM_MODEL")
 
 block seatCountEverywhere:
   let variants = manifest{"variants"}
@@ -68,15 +72,27 @@ block everyDeclaredPlayerIsSeated:
   var seated: seq[string]
   for row in manifest{"certification"}{"players"}:
     seated.add(row{"player_id"}.getStr())
-  check(manifest{"player"}.len == 2, "exactly two declared player entries")
-  for entry in manifest{"player"}:
+  check(manifest{"player"}.len == 3,
+    "three declared player entries: native model + two scripted baselines")
+  let nativeEntry = manifest{"player"}[0]
+  check(nativeEntry{"id"}.getStr() == "hidden-agenda-player",
+    "first player entry must be the native model player")
+  check(nativeEntry{"env"}{"COWORLD_LLM_ENABLED"}.getStr() == "true",
+    "native model player must set COWORLD_LLM_ENABLED=true")
+  check(nativeEntry{"env"}{"COWORLD_LLM_MODEL"}.getStr().len > 0,
+    "native model player must set default COWORLD_LLM_MODEL")
+  check(nativeEntry{"env"}{"PLAYER_SCRIPTED"}.isNil,
+    "native model player must not set PLAYER_SCRIPTED")
+  for idx, entry in manifest{"player"}.elems:
     let id = entry{"id"}.getStr()
     check(id in seated, "player entry " & id & " has no certification slot")
     check(entry{"type"}.getStr() == "player", id & " must be type player")
     check(entry{"name"}.getStr().len > 0, id & " needs a name")
     check(entry{"description"}.getStr().len > 0, id & " needs a description")
     check(entry{"run"}.len >= 1, id & " needs a run argv")
-    check(entry{"env"}.len >= 1, id & " needs its PLAYER_SCRIPTED env")
+    if idx > 0:
+      check(entry{"env"}{"PLAYER_SCRIPTED"}.getStr().len > 0,
+        id & " needs its explicit PLAYER_SCRIPTED env")
 
 block replayViewerIsAStaticBundle:
   check(game{"replay_viewer"}{"bundle"}.getStr() == "static-replay-viewer",
@@ -221,10 +237,15 @@ block theCertificationEpisodeActuallyPlays:
   config.update($node)
   var kinds: seq[ScriptKind]
   for row in manifest{"certification"}{"players"}:
-    kinds.add(parseScriptKind(
-      row{"player_id"}.getStr().replace("hidden-agenda-", "")))
+    let pid = row{"player_id"}.getStr()
+    if pid == "hidden-agenda-player":
+      ## Offline deterministic replay check substitutes explicit scripted miner
+      ## for the native model seat so offline tests never require live credentials.
+      kinds.add(skMiner)
+    else:
+      kinds.add(parseScriptKind(pid.replace("hidden-agenda-", "")))
   for kind in kinds:
-    check(kind != skNone, "every certification seat names a real baseline")
+    check(kind != skNone, "every offline replay seat names a real baseline")
   let episode = playEpisode(config, kinds)
   let seconds = episode.frames.len.float / TargetFps.float
   check(seconds > 20.0,

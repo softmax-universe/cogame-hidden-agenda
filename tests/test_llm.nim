@@ -27,33 +27,51 @@ proc parses(sim: Sim, slot: int, text: string): bool =
     false
 
 block extraction:
-  let fenced = "```json\n{\"plan\":[{\"job\":\"guard\"}]}\n```"
-  check(extractJsonObject(fenced){"plan"}.len == 1,
-    "a fenced reply is extracted")
+  let bare = "{\"plan\":[{\"job\":\"guard\"}]}"
+  check(extractJsonObject(bare){"plan"}.len == 1,
+    "a bare JSON object is extracted")
+  let fencedJson = "```json\n{\"plan\":[{\"job\":\"guard\"}]}\n```"
+  check(extractJsonObject(fencedJson){"plan"}.len == 1,
+    "a json-tagged outer markdown fence is extracted")
+  let fencedPlain = "```\n{\"plan\":[{\"job\":\"guard\"}]}\n```"
+  check(extractJsonObject(fencedPlain){"plan"}.len == 1,
+    "a plain outer markdown fence is extracted")
   let bomAndBraces = "\xEF\xBB\xBF```json\n" &
-    "{\"plan\":[{\"job\":\"guard\"}],\"notes\":\"watch \\\"}\\\" and {NW}\"}\n```\n" &
-    "Extra note mentioning {\"job\":\"hold\"} and stray }."
+    "{\"plan\":[{\"job\":\"guard\"}],\"notes\":\"watch \\\"}\\\" and {NW}\"}\n```"
   let extracted = extractJsonObject(bomAndBraces)
   check(extracted{"plan"}.len == 1,
-    "BOM, fences, string braces, and trailing {braces} stop at the first object")
+    "BOM, single outer fence, and string braces parse cleanly")
   check(extracted{"notes"}.getStr() == "watch \"}\" and {NW}",
-    "string-internal braces and escaped quotes survive balanced extraction")
-  let prose = "Sure! Here is my plan.\n{\"plan\":[{\"job\":\"hold\"}]}\nHope " &
-    "that helps."
-  check(extractJsonObject(prose){"plan"}.len == 1,
-    "a prose-prefixed reply is extracted")
-  var raised = false
-  try:
-    discard extractJsonObject("I would rather not answer that.")
-  except CatchableError:
-    raised = true
-  check(raised, "a reply with no object at all raises")
-  var unbalanced = false
-  try:
-    discard extractJsonObject("{\"plan\":[{\"job\":\"hold\"}]")
-  except CatchableError:
-    unbalanced = true
-  check(unbalanced, "an unbalanced JSON object raises")
+    "string-internal braces and escaped quotes survive parsing")
+
+  for bad in [
+    ("leading prose",
+      "Sure! Here is my plan.\n{\"plan\":[{\"job\":\"hold\"}]}"),
+    ("trailing prose",
+      "{\"plan\":[{\"job\":\"hold\"}]}\nHope that helps."),
+    ("prose around fence",
+      "Here you go:\n```json\n{\"plan\":[{\"job\":\"hold\"}]}\n```"),
+    ("trailing prose after fence",
+      "```json\n{\"plan\":[{\"job\":\"hold\"}]}\n```\nExtra note mentioning {\"job\":\"guard\"}."),
+    ("extra JSON object",
+      "{\"plan\":[{\"job\":\"hold\"}]} {\"plan\":[{\"job\":\"guard\"}]}"),
+    ("two fenced objects",
+      "```json\n{\"plan\":[{\"job\":\"hold\"}]}\n```\n```json\n{\"plan\":[{\"job\":\"guard\"}]}\n```"),
+    ("unsupported fence tag",
+      "```python\n{\"plan\":[{\"job\":\"hold\"}]}\n```"),
+    ("no object at all",
+      "I would rather not answer that."),
+    ("unbalanced JSON object",
+      "{\"plan\":[{\"job\":\"hold\"}]"),
+    ("non-object JSON array",
+      "[{\"job\":\"hold\"}]")
+  ]:
+    var raised = false
+    try:
+      discard extractJsonObject(bad[1])
+    except CatchableError:
+      raised = true
+    check(raised, bad[0] & " must be rejected")
 
 block schema:
   var sim = rig()
@@ -109,56 +127,36 @@ block meetingSchema:
   check(parses(sim, 0, "{" & plan & ",\"vote\":\"PINK\",\"switch\":null}"),
     "a null switch is no conditional at all")
 
-block theCompactJobFormTheSystemPromptTeachesIsHonoured:
-  ## The system prompt documents `mine at:<seam>` / `watch who:<cog>` /
-  ## `patrol room:<r>`, so a model that writes that string into "job" is
-  ## obeying our own instructions. Rejecting it burned both attempts and put
-  ## the seat on the scripted baseline (hosted league 2026-08-26: 10 of round
-  ## 3's 14 attempt-failures were `unknown job: mine at:s2` and the corrective
-  ## `mine needs at: ... got ''`).
+block compactJobShimsAreRejectedAndPromptsAreCanonical:
   var sim = rig()
-  proc plan(sim: Sim, slot: int, text: string): seq[PlanStep] =
-    parseReply(sim, slot, extractJsonObject(text)).plan
+  ## Legacy compact job strings inside "job" are rejected; arguments must be
+  ## in their sibling JSON keys.
+  for legacy in [
+    (0, "{\"plan\":[{\"job\":\"mine at:S2\"}]}"),
+    (0, "{\"plan\":[{\"job\":\"watch who:PINK\"}]}"),
+    (0, "{\"plan\":[{\"job\":\"patrol room:NW\"}]}"),
+    (4, "{\"plan\":[{\"job\":\"hunt who:GREEN\"}]}"),
+    (4, "{\"plan\":[{\"job\":\"strike who:RED\"}]}"),
+    (4, "{\"plan\":[{\"job\":\"lurk room:SE\"}]}")
+  ]:
+    check(not parses(sim, legacy[0], legacy[1]),
+      "compact job shim must be rejected: " & legacy[1])
 
-  let compactMine = plan(sim, 0, "{\"plan\":[{\"job\":\"mine at:S2\"}]}")
-  let canonicalMine = plan(sim, 0,
-    "{\"plan\":[{\"job\":\"mine\",\"at\":\"S2\"}]}")
-  check(compactMine == canonicalMine,
-    "mine at:S2 parses to the same plan as the sibling-key form")
-  check(compactMine[0].job == jkMine and compactMine[0].at == "S2",
-    "and it is mine at S2")
-  check(plan(sim, 0, "{\"plan\":[{\"job\":\"mine at:s2\"}]}") == canonicalMine,
-    "the compact argument is case-insensitive, like the sibling key")
-
-  check(plan(sim, 0, "{\"plan\":[{\"job\":\"watch who:PINK\"}]}") ==
-    plan(sim, 0, "{\"plan\":[{\"job\":\"watch\",\"who\":\"PINK\"}]}"),
-    "watch who:PINK matches its canonical form")
-  check(plan(sim, 0, "{\"plan\":[{\"job\":\"patrol room:NW\"}]}") ==
-    plan(sim, 0, "{\"plan\":[{\"job\":\"patrol\",\"room\":\"NW\"}]}"),
-    "patrol room:NW matches its canonical form")
-  ## Slot 4 is the impostor in this rig.
-  check(plan(sim, 4, "{\"plan\":[{\"job\":\"hunt who:GREEN\"}]}") ==
-    plan(sim, 4, "{\"plan\":[{\"job\":\"hunt\",\"who\":\"GREEN\"}]}"),
-    "hunt who:GREEN matches its canonical form")
-  check(plan(sim, 4, "{\"plan\":[{\"job\":\"strike who:RED\"}]}") ==
-    plan(sim, 4, "{\"plan\":[{\"job\":\"strike\",\"who\":\"RED\"}]}"),
-    "strike who:RED matches its canonical form")
-  check(plan(sim, 4, "{\"plan\":[{\"job\":\"lurk room:SE\"}]}") ==
-    plan(sim, 4, "{\"plan\":[{\"job\":\"lurk\",\"room\":\"SE\"}]}"),
-    "lurk room:SE matches its canonical form")
-
-  ## Tolerance is only for the documented form: nothing else is loosened.
   check(not parses(sim, 0, "{\"plan\":[{\"job\":\"teleport\"}]}"),
-    "a genuinely unknown job is still invalid")
-  check(not parses(sim, 0, "{\"plan\":[{\"job\":\"scuttle at:S2\"}]}"),
-    "and so is an unknown job carrying a compact argument")
-  check(not parses(sim, 0, "{\"plan\":[{\"job\":\"mine at:S9\"}]}"),
-    "a compact argument still has to name a real seam")
-  check(not parses(sim, 0, "{\"plan\":[{\"job\":\"hunt who:PINK\"}]}"),
-    "and crew still may not hunt in the compact form")
+    "a genuinely unknown job is invalid")
 
-  ## The other half of the fix: the reply schema in the prompt now spells the
-  ## sibling keys, so the model is never left to guess from `{"job":...}`.
+  ## Both systemPrompt and userPrompt teach the canonical JSON step objects.
+  let sysCrew = systemPrompt(sim, 0, PromptSelection())
+  check("{\"job\":\"mine\",\"at\":\"<seam>\"}" in sysCrew,
+    "systemPrompt teaches canonical JSON step shape")
+  check("mine at:" notin sysCrew,
+    "systemPrompt does not teach contradictory compact job syntax")
+  let sysImp = systemPrompt(sim, 4, PromptSelection())
+  check("{\"job\":\"hunt\",\"who\":\"<cog>\"}" in sysImp,
+    "impostor systemPrompt teaches canonical JSON step shape")
+  check("hunt who:" notin sysImp,
+    "impostor systemPrompt does not teach contradictory compact job syntax")
+
   let hint = userPrompt(sim, 0, "", "opening")
   check("top-level keys are ONLY plan, hunch, notes" in hint,
     "opening prompt forbids top-level step keys")
@@ -186,22 +184,26 @@ block theCompactJobFormTheSystemPromptTeachesIsHonoured:
   check(parses(sim, 0, "{\"plan\":[{\"job\":\"watch\",\"who\":\"BLUE\"}]}"),
     "every step the hint shows is itself a valid step")
 
-block aHalfWrittenSwitchDegradesRatherThanInvalidating:
-  ## `switch` is optional. Throwing away a whole reply -- plan, vote and all --
-  ## because the model wrote one of the two keys cost real decisions in the
-  ## hosted league (round 2, 2026-08-26: `switch needs both "if" and "to"`).
+block aHalfWrittenSwitchIsRejected:
   var sim = rig()
   sim.openMeetingForTest(mcCadence)
   const plan = "\"plan\":[{\"job\":\"guard\"}]"
   for half in ["{\"if\":\"tie\"}", "{\"to\":\"skip\"}", "{}"]:
     let reply = "{" & plan & ",\"vote\":\"PINK\",\"switch\":" & half & "}"
-    check(parses(sim, 0, reply),
-      "a one-sided switch " & half & " does not invalidate the reply")
-    let decision = parseReply(sim, 0, extractJsonObject(reply))
-    check(decision.switchIf.len == 0 and decision.switchTo.len == 0,
-      "it degrades to no conditional at all")
-    check(decision.vote == "PINK" and decision.plan.len == 1,
-      "and the plan and the vote survive")
+    check(not parses(sim, 0, reply),
+      "a half-written switch " & half & " must be rejected")
+  ## Omitted switch and null switch remain valid optional defaults.
+  check(parses(sim, 0, "{" & plan & ",\"vote\":\"PINK\"}"),
+    "omitted switch is valid")
+  check(parses(sim, 0, "{" & plan & ",\"vote\":\"PINK\",\"switch\":null}"),
+    "null switch is valid")
+
+block legacyScriptKindAliasesAreRejected:
+  check(parseScriptKind("miner") == skMiner, "miner is valid")
+  check(parseScriptKind("lurker") == skLurker, "lurker is valid")
+  for legacy in ["1", "true", "yes", "lurk", "bot"]:
+    check(parseScriptKind(legacy) == skNone,
+      "legacy alias '" & legacy & "' must not resolve to a baseline")
 
 block sayIsIgnoredNotRejected:
   var sim = rig("hidden-agenda-notalk")
@@ -236,16 +238,24 @@ block capsAreRuneSafe:
   check(decision.notes.runeLen <= MaxNotesLen, "notes is capped in runes")
   check(validateUtf8(decision.notes) == -1, "and the cut is never mid-rune")
 
+proc okStubClient(): LlmClient =
+  const good = """{"plan":[{"job":"guard"}],"vote":"skip"}"""
+  proc send(batch: RequestBatch, timeoutSeconds: int):
+      ResponseBatch {.closure.} =
+    for _ in 0 ..< batch.len:
+      result.add((Response(code: 200, body: $(%*{
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": good}]
+      })), ""))
+  stubbedLlmClient(send)
+
 block oneBatchCarriesEveryEligibleSeat:
-  ## With no credentials the client disables itself, so every seat falls back
-  ## instantly and the DRIVER's bookkeeping is what is under test: one batch
-  ## per decision point, every eligible seat in it, frozen seats excluded.
   var sim = rig()
-  let client = disabledLlmClient()
+  let client = okStubClient()
   var prompts: seq[string]
   var kinds: seq[ScriptKind]
   for _ in 0 ..< Seats:
-    prompts.add("")
+    prompts.add("play well")
     kinds.add(skNone)
   var now = 0.0
   var slept = 0.0
@@ -260,9 +270,9 @@ block oneBatchCarriesEveryEligibleSeat:
   var decisions = driver.decide(sim, seats, "opening")
   check(decisions.len == Seats, "one decision per seat")
   for decision in decisions:
-    check(decision.source == dsFallback,
-      "with no credentials every seat falls back to the scripted decision")
-    check(decision.plan.len >= 1, "and the fallback is a legal plan")
+    check(decision.source == dsLlm,
+      "valid LLM replies are recorded as llm")
+    check(decision.plan.len >= 1, "and carry a legal plan")
   sim.cogs[2].state = csFrozen
   seats = sim.activeSeats()
   check(seats.len == Seats - 1, "a frozen seat is not in the batch")
@@ -271,15 +281,40 @@ block oneBatchCarriesEveryEligibleSeat:
   check(driver.batchSizes == @[Seats, Seats - 1],
     "exactly two batches were issued, of 5 then 4 requests")
 
+block disabledClientFailsPromptSeatsButAllowsScriptedSeats:
+  var sim = rig()
+  let client = disabledLlmClient()
+  var prompts: seq[string]
+  var scriptedKinds: seq[ScriptKind]
+  var llmKinds: seq[ScriptKind]
+  for _ in 0 ..< Seats:
+    prompts.add("play well")
+    scriptedKinds.add(skMiner)
+    llmKinds.add(skNone)
+  let seats = sim.activeSeats()
+  let scripted = client.decideAll(sim, seats, prompts, scriptedKinds, "opening",
+    PromptSelection())
+  for decision in scripted:
+    check(decision.source == dsScripted,
+      "genuine scripted seats still run without LLM credentials")
+  var infraRaised = false
+  try:
+    discard client.decideAll(sim, seats, prompts, llmKinds, "opening",
+      PromptSelection())
+  except InfraFailureError:
+    infraRaised = true
+  check(infraRaised,
+    "prompt seat without LLM credentials raises InfraFailureError instead of blaming a player or falling back")
+
 block minBatchSecondsFloorsTheSpacing:
   var sim = rig()
   var config = sim.config
   config.minBatchSeconds = 14
-  let client = disabledLlmClient()
+  let client = okStubClient()
   var prompts: seq[string]
   var kinds: seq[ScriptKind]
   for _ in 0 ..< Seats:
-    prompts.add("")
+    prompts.add("play well")
     kinds.add(skNone)
   var now = 0.0
   proc clock(): float {.closure.} = now
@@ -298,11 +333,11 @@ block maxDecisionBatchesCaps:
   var config = sim.config
   config.minBatchSeconds = 0
   config.maxDecisionBatches = 3
-  let client = disabledLlmClient()
+  let client = okStubClient()
   var prompts: seq[string]
   var kinds: seq[ScriptKind]
   for _ in 0 ..< Seats:
-    prompts.add("")
+    prompts.add("play well")
     kinds.add(skNone)
   proc clock(): float {.closure.} = 0.0
   proc sleeper(seconds: float) {.closure.} = discard
@@ -311,11 +346,14 @@ block maxDecisionBatchesCaps:
   for round in 0 ..< 3:
     discard driver.decide(sim, seats, "meeting")
   check(driver.batchSizes.len == 3, "three batches were issued")
-  let after = driver.decide(sim, seats, "meeting")
+  var infraRaised = false
+  try:
+    discard driver.decide(sim, seats, "meeting")
+  except InfraFailureError:
+    infraRaised = true
   check(driver.batchSizes.len == 3, "and never a fourth")
-  for decision in after:
-    check(decision.source == dsBudget,
-      "past the cap every seat reuses its previous decision as \"budget\"")
+  check(infraRaised,
+    "past the cap non-scripted seats raise InfraFailureError instead of reusing stale previous moves")
 
 block theDeadlineSettlesEarly:
   var config = baseConfig(4)
@@ -417,8 +455,7 @@ block theRetryBatchAndTheFallbackAreDriven:
         $decision.source)
       check(decision.plan.len >= 1, "and is a legal plan")
 
-  ## (2) A 429 on both attempts: two batches, then the scripted fallback,
-  ## recorded as such. decideAll never raises.
+  ## (2) A 429 on both attempts: two batches, then InfraFailureError (no fallback, no player blame).
   block:
     var sim = rig()
     var batches = 0
@@ -434,16 +471,18 @@ block theRetryBatchAndTheFallbackAreDriven:
       prompts.add("play well")
       kinds.add(skNone)
     let seats = sim.activeSeats()
-    let decisions = client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
-    check(batches == 2, "a 429 is retried once and then given up on, got " &
+    var infraRaised = false
+    try:
+      discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
+    except InfraFailureError:
+      infraRaised = true
+    check(batches == 2, "a 429 is retried once and then fails, got " &
       $batches & " batches")
-    for decision in decisions:
-      check(decision.source == dsFallback,
-        "and the fallback is RECORDED, got " & $decision.source)
-      check(decision.plan.len >= 1, "and is a legal plan")
+    check(infraRaised,
+      "exhausted 429 raises InfraFailureError instead of blaming a player or falling back")
 
-  ## (3) A 403 disables the client outright: one batch, every seat falls back,
-  ## and every LATER decision point goes straight to the fallback.
+  ## (3) A 403 disables the client outright: one batch, raises InfraFailureError,
+  ## and every LATER decision point also fails immediately without issuing a batch.
   block:
     var sim = rig()
     var batches = 0
@@ -459,17 +498,23 @@ block theRetryBatchAndTheFallbackAreDriven:
       prompts.add("play well")
       kinds.add(skNone)
     let seats = sim.activeSeats()
-    var decisions = client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
+    var infraRaised = false
+    try:
+      discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
+    except InfraFailureError:
+      infraRaised = true
     check(batches == 1, "a 403 stops the ladder inside the first batch")
     check(client.disabled, "and disables the client")
-    for decision in decisions:
-      check(decision.source == dsFallback, "every seat falls back")
-    decisions = client.decideAll(sim, seats, prompts, kinds, "meeting", PromptSelection())
+    check(infraRaised, "and raises InfraFailureError")
+    infraRaised = false
+    try:
+      discard client.decideAll(sim, seats, prompts, kinds, "meeting", PromptSelection())
+    except InfraFailureError:
+      infraRaised = true
     check(batches == 1, "a disabled client never issues another batch")
-    for decision in decisions:
-      check(decision.source == dsFallback, "and every later seat is scripted")
+    check(infraRaised, "and raises InfraFailureError on later calls")
 
-  ## (4) Junk that is not JSON at all, twice: two batches, then the fallback.
+  ## (4) Junk that is not JSON at all, twice: two batches, then PlayerFailureError.
   block:
     var sim = rig()
     var batches = 0
@@ -485,12 +530,14 @@ block theRetryBatchAndTheFallbackAreDriven:
       prompts.add("play well")
       kinds.add(skNone)
     let seats = sim.activeSeats()
-    let decisions = client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
+    var failedSlot = -1
+    try:
+      discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
+    except PlayerFailureError as err:
+      failedSlot = err.slot
     check(batches == 2, "junk is retried once")
-    for decision in decisions:
-      check(decision.source == dsFallback,
-        "and then falls back, got " & $decision.source)
-      check(decision.plan.len >= 1, "with a legal plan")
+    check(failedSlot == 0,
+      "and then raises PlayerFailureError instead of falling back")
 
   ## (5) A seat that answers on the first attempt is NOT in the retry batch:
   ## only the seats that failed are retried.
