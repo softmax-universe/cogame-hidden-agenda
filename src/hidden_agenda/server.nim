@@ -158,6 +158,27 @@ proc broadcastFinal() =
     except CatchableError as error:
       echo "hidden-agenda: final frame to slot ", slot, " failed: ", error.msg
 
+proc abortEpisode(runtimeConfig: RuntimeConfig, message: string) =
+  withLock stateLock:
+    if shared.finished:
+      return
+    shared.finished = true
+    for _, socket in shared.playerSockets:
+      try:
+        socket.close()
+      except CatchableError:
+        discard
+    for socket in shared.globalSockets:
+      try:
+        socket.close()
+      except CatchableError:
+        discard
+  if runtimeConfig.logUri.len > 0:
+    try:
+      writeLog(runtimeConfig, message & "\n")
+    except CatchableError as error:
+      echo "hidden-agenda: failed to write failure log: ", error.msg
+
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
@@ -222,18 +243,21 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       echo "hidden-agenda: starting with ", connected, "/", shared.seats,
         " players connected"
       refreshSnapshotLocked()
-    if noShow >= 0:
-      let msg =
-        if connected == 0:
-          "no player connected within connect timeout"
-        else:
-          "player slot " & $noShow & " never registered"
+    if connected == 0:
+      ## Pre-existing rule (docs/RULES.md): no seat connected within 120 s -> forfeit.
+      let msg = "no player connected within connect timeout"
       echo "hidden-agenda: ", msg, "; forfeiting"
-      declarePlayerFailure(noShow, msg)
+      declarePlayerFailure(0, msg)
       gameSim.settle("forfeit", "forfeit", "none")
       finishEpisode(runtimeConfig)
       sleep(config.shutdownGraceSeconds * 1000)
       quit(0)
+    if noShow >= 0:
+      let msg = "player slot " & $noShow & " never registered"
+      echo "hidden-agenda: ", msg, "; aborting unscored"
+      declarePlayerFailure(noShow, msg)
+      abortEpisode(runtimeConfig, msg)
+      quit(1)
 
     var prompts: seq[string]
     var kinds: seq[ScriptKind]
@@ -256,8 +280,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var externalSeats: seq[int]
       var externalIndices: seq[int]
       var decisionId: int
-      var requestExternal = false
       var disconnectedSeat = -1
+      var externalBudgetError = ""
       withLock stateLock:
         pushStateFrames(cause)
         driver.prompts = shared.prompts
@@ -274,89 +298,80 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           else:
             internalSeats.add(seat)
             internalIndices.add(index)
-        requestExternal = externalSeats.len > 0 and
-          driver.batches < driver.maxBatches and not driver.pastDeadline()
         shared.pendingActions = newSeq[JsonNode](shared.seats)
         shared.pendingErrors = newSeq[string](shared.seats)
-        if disconnectedSeat < 0 and requestExternal:
-          inc shared.decisionId
-          decisionId = shared.decisionId
-          for seat in externalSeats:
-            if shared.playerSockets.hasKey(seat):
-              try:
-                shared.playerSockets[seat].send($ %*{
-                  "type": "observation", "id": decisionId,
-                  "observation": seatView(view, seat, cause)})
-              except CatchableError:
-                shared.disconnected[seat] = true
+        if disconnectedSeat < 0 and externalSeats.len > 0:
+          if driver.pastDeadline():
+            driver.deadlineHit = true
+            externalBudgetError = "play deadline reached at decision point"
+          elif driver.batches >= driver.maxBatches:
+            externalBudgetError = "decision batch limit (" & $driver.maxBatches &
+              ") reached before episode completed"
+          else:
+            inc shared.decisionId
+            decisionId = shared.decisionId
+            for seat in externalSeats:
+              if shared.playerSockets.hasKey(seat):
+                try:
+                  shared.playerSockets[seat].send($ %*{
+                    "type": "observation", "id": decisionId,
+                    "observation": seatView(view, seat, cause)})
+                except CatchableError:
+                  shared.disconnected[seat] = true
       if disconnectedSeat >= 0:
         raisePlayerFailure(disconnectedSeat,
           "player slot " & $disconnectedSeat & " disconnected")
+      if externalBudgetError.len > 0:
+        raiseInfraFailure(externalBudgetError)
       if internalSeats.len > 0:
         let internalDecisions = driver.decide(view, internalSeats, cause)
         for i, index in internalIndices:
           result[index] = internalDecisions[i]
-      elif requestExternal:
+      elif externalSeats.len > 0:
         driver.batches.inc
         driver.batchSizes.add(externalSeats.len)
       if externalSeats.len > 0:
-        if requestExternal:
-          let started = epochTime()
-          let deadline = epochTime() + config.llmTimeoutSeconds.float
-          while epochTime() < deadline:
-            var ready = true
-            withLock stateLock:
-              for seat in externalSeats:
-                if shared.pendingActions[seat].isNil and
-                    shared.pendingErrors[seat].len == 0 and
-                    not shared.disconnected[seat] and
-                    shared.playerSockets.hasKey(seat):
-                  ready = false
-            if ready:
-              break
-            sleep(20)
-          for i, seat in externalSeats:
-            let index = externalIndices[i]
-            var action: JsonNode
-            var errMsg: string
-            var lost = false
-            withLock stateLock:
-              action = shared.pendingActions[seat]
-              errMsg = shared.pendingErrors[seat]
-              lost = shared.disconnected[seat] or
-                not shared.playerSockets.hasKey(seat)
-            if errMsg.len > 0:
+        let started = epochTime()
+        let deadline = epochTime() + config.llmTimeoutSeconds.float
+        while epochTime() < deadline:
+          var ready = true
+          withLock stateLock:
+            for seat in externalSeats:
+              if shared.pendingActions[seat].isNil and
+                  shared.pendingErrors[seat].len == 0 and
+                  not shared.disconnected[seat] and
+                  shared.playerSockets.hasKey(seat):
+                ready = false
+          if ready:
+            break
+          sleep(20)
+        for i, seat in externalSeats:
+          let index = externalIndices[i]
+          var action: JsonNode
+          var errMsg: string
+          var lost = false
+          withLock stateLock:
+            action = shared.pendingActions[seat]
+            errMsg = shared.pendingErrors[seat]
+            lost = shared.disconnected[seat] or
+              not shared.playerSockets.hasKey(seat)
+          if errMsg.len > 0:
+            raisePlayerFailure(seat,
+              "external player slot " & $seat & " rejected action: " & errMsg)
+          if action.isNil:
+            if lost:
               raisePlayerFailure(seat,
-                "external player slot " & $seat & " rejected action: " & errMsg)
-            if action.isNil:
-              if lost:
-                raisePlayerFailure(seat,
-                  "external player slot " & $seat & " disconnected before acting")
-              raisePlayerFailure(seat,
-                "external player slot " & $seat & " timed out without submitting an action")
-            try:
-              result[index] = view.parseReply(seat, action)
-            except CatchableError as error:
-              raisePlayerFailure(seat,
-                "external player slot " & $seat & " rejected action: " &
-                cleanText(error.msg, MaxErrorLen))
-            result[index].source = dsExternal
-            result[index].latencyMs = int((epochTime() - started) * 1000)
-            driver.previous[seat] = result[index]
-            driver.hasPrevious[seat] = true
-        else:
-          if driver.pastDeadline():
-            driver.deadlineHit = true
-          for i, seat in externalSeats:
-            let index = externalIndices[i]
-            if driver.hasPrevious[seat]:
-              result[index] = driver.previous[seat]
-              result[index].source = dsBudget
-              result[index].latencyMs = 0
-            else:
-              raisePlayerFailure(seat,
-                "decision budget exhausted with no previous decision for seat " &
-                $seat)
+                "external player slot " & $seat & " disconnected before acting")
+            raisePlayerFailure(seat,
+              "external player slot " & $seat & " timed out without submitting an action")
+          try:
+            result[index] = view.parseReply(seat, action)
+          except CatchableError as error:
+            raisePlayerFailure(seat,
+              "external player slot " & $seat & " rejected action: " &
+              cleanText(error.msg, MaxErrorLen))
+          result[index].source = dsExternal
+          result[index].latencyMs = int((epochTime() - started) * 1000)
 
     proc onTick(view: var Sim) {.closure.} =
       if view.tick mod 24 == 0 or view.done:
@@ -368,7 +383,17 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     except PlayerFailureError as error:
       echo "hidden-agenda: player slot ", error.slot, " failed: ", error.msg
       declarePlayerFailure(error.slot, error.msg)
-      gameSim.settle("forfeit", "forfeit", "none")
+      abortEpisode(runtimeConfig,
+        "player failure (slot " & $error.slot & "): " & error.msg)
+      quit(1)
+    except InfraFailureError as error:
+      echo "hidden-agenda: infrastructure failure: ", error.msg
+      abortEpisode(runtimeConfig, "infrastructure failure: " & error.msg)
+      quit(1)
+    except CatchableError as error:
+      echo "hidden-agenda: episode error: ", error.msg
+      abortEpisode(runtimeConfig, "episode error: " & error.msg)
+      quit(1)
     withLock stateLock:
       pushStateFrames("final")
     finishEpisode(runtimeConfig)

@@ -628,15 +628,18 @@ proc applyDecision*(sim: var Sim, slot: int, decision: Decision,
   sim.cogs[slot].lastHunch = decision.hunch
   sim.lastDecisionSource[slot] = decision.source
   if inMeeting:
-    sim.votes[slot] =
-      if decision.vote.len > 0 and
-          (decision.vote == "skip" or sim.isActiveAlias(decision.vote)):
-        decision.vote
-      else:
-        "skip"
-    if decision.switchIf.len > 0 and
-        (decision.switchIf == "tie" or sim.isActiveAlias(decision.switchIf)) and
-        (decision.switchTo == "skip" or sim.isActiveAlias(decision.switchTo)):
+    if decision.vote != "skip" and not sim.isActiveAlias(decision.vote):
+      raise newException(HiddenAgendaError,
+        "invalid meeting vote for slot " & $slot & ": '" & decision.vote & "'")
+    sim.votes[slot] = decision.vote
+    if decision.switchIf.len > 0 or decision.switchTo.len > 0:
+      if (decision.switchIf != "tie" and
+          not sim.isActiveAlias(decision.switchIf)) or
+          (decision.switchTo != "skip" and
+          not sim.isActiveAlias(decision.switchTo)):
+        raise newException(HiddenAgendaError,
+          "invalid meeting switch for slot " & $slot & ": if='" &
+          decision.switchIf & "' to='" & decision.switchTo & "'")
       sim.switchIf[slot] = decision.switchIf
       sim.switchTo[slot] = decision.switchTo
     if sim.config.chat:

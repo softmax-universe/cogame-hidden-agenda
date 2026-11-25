@@ -10,12 +10,12 @@ coworld upload-policy coworld-hidden-agenda:latest \
   --name my-hidden-agenda \
   --run /bin/hidden-agenda-player \
   --secret-env PLAYER_PROMPT="<your strategy, both roles>" \
-  --secret-env USE_BEDROCK=true
+  --secret-env COWORLD_LLM_ENABLED=true
 ```
 
-`USE_BEDROCK=true` is not optional for an LLM policy: the platform gates the
-player pod's Bedrock sidecar on it, and without LLM credentials a prompt seat
-fails and forfeits the episode.
+`COWORLD_LLM_ENABLED=true` is not optional for an LLM policy: the platform
+enables the hosted LLM sidecar on it, and without LLM credentials a prompt seat
+fails as an infrastructure error and terminates the unfinished episode unscored.
 
 A scripted baseline is the same image with a different env:
 
@@ -115,8 +115,11 @@ must place its argument (`at`, `who`, `room`) in the sibling JSON key alongside
 
 An invalid prompt-policy reply is retried **once** in the same decision point's
 batch with a hint. Still failing — or an invalid/missing external action —
-records a player failure (`COGAME_PLAYER_FAILURE_URI`) and settles the episode
-as `forfeit` with post-game results and replay written.
+records a player failure (`COGAME_PLAYER_FAILURE_URI`) and terminates the
+unfinished episode unscored without writing authoritative `results.json` scores.
+Provider or infrastructure failures (missing credentials, HTTP 401/403/429/5xx,
+transport errors, or decision budget exhaustion) likewise terminate the
+unfinished episode unscored without attributing blame to a player seat.
 
 ## The scripted baselines
 

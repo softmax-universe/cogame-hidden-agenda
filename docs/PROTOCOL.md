@@ -49,8 +49,9 @@ game actions:
 The game sends `observation` only at a decision point for an active seat. The
 `id` pairs the action with that decision point. The game validates the action
 with the same plan and vote rules used for prompt policies. A rejected or
-missing action declares a player failure and settles the episode as `forfeit`.
-The game owns results and replay for every policy.
+missing action declares a player failure (`COGAME_PLAYER_FAILURE_URI`) and
+terminates the unfinished episode unscored without writing authoritative
+`results.json` scores. The game owns results and replay for completed episodes.
 
 ## Routes
 
@@ -68,10 +69,12 @@ The game owns results and replay for every policy.
 `tools/build_replay_viewer.sh`, served straight off the platform's CDN and
 contacts nothing but S3 for the `.replay` file. No pod path serves a replay page.
 
-Startup randomises the seed **before** `config.update`, waits up to
+Startup randomises the seed **before** `config.update` and waits up to
 `playerConnectTimeoutSeconds = 120` for all five sockets to connect and
-register, declares a player failure and settles `forfeit` if any seat fails to
-register, and otherwise runs the tick loop.
+register. If no seat connects within 120 s, the episode settles as `forfeit`
+(per [RULES.md](RULES.md)); if only a subset of seats register, the missing
+seat is recorded as a player failure and the unfinished episode terminates
+unscored. Otherwise the server runs the tick loop.
 
 Shutdown, in order: `final` to all five sockets → the last global frame →
 `sleep 500 ms` → `results.json` → the replay → keep `/healthz` and `/global`

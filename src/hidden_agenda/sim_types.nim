@@ -69,6 +69,7 @@ type
   HiddenAgendaError* = object of CatchableError
   PlayerFailureError* = object of HiddenAgendaError
     slot*: int
+  InfraFailureError* = object of HiddenAgendaError
 
   Facing* = enum
     fN = "N", fE = "E", fS = "S", fW = "W"
@@ -99,7 +100,7 @@ type
 
   DecisionSource* = enum
     dsLlm = "llm", dsExternal = "external", dsRetry = "retry",
-    dsScripted = "scripted", dsBudget = "budget"
+    dsScripted = "scripted"
 
   Decision* = object
     plan*: seq[PlanStep]

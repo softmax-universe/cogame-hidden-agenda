@@ -814,29 +814,41 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
+proc raisePlayerFailure*(slot: int, message: string) {.noreturn.} =
+  var err = newException(PlayerFailureError, message)
+  err.slot = slot
+  raise err
+
+proc raiseInfraFailure*(message: string) {.noreturn.} =
+  raise newException(InfraFailureError, message)
+
 proc textOf*(client: LlmClient, response: Response, error, url: string):
     string =
   if error.len > 0:
-    raise newException(HiddenAgendaError, "llm transport: " & error)
+    raiseInfraFailure("llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = cleanText(response.body, 200)
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(HiddenAgendaError,
-        "bedrock model access denied: " & detail)
+      raiseInfraFailure("bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(HiddenAgendaError,
+    raiseInfraFailure(
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     discard client.tryNextBedrockModel("throttled")
-    raise newException(HiddenAgendaError,
+    raiseInfraFailure(
       "llm throttled (429): " & cleanText(response.body, 200))
   if response.code < 200 or response.code >= 300:
-    raise newException(HiddenAgendaError, "anthropic error " & $response.code &
+    raiseInfraFailure("llm provider error " & $response.code &
       ": " & cleanText(response.body, 200))
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as parseErr:
+    raiseInfraFailure("invalid provider JSON response: " &
+      cleanText(parseErr.msg, 200))
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(HiddenAgendaError, "anthropic refusal")
+    raise newException(HiddenAgendaError, "model refusal")
   let content = payload{"content"}
   if content != nil and content.kind == JArray:
     for contentBlock in content:
@@ -845,11 +857,6 @@ proc textOf*(client: LlmClient, response: Response, error, url: string):
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
     raise newException(HiddenAgendaError,
       "reply cut off at max_tokens before any JSON: " & cleanText(result, 160))
-
-proc raisePlayerFailure*(slot: int, message: string) {.noreturn.} =
-  var err = newException(PlayerFailureError, message)
-  err.slot = slot
-  raise err
 
 proc decideAll*(
   client: LlmClient,
@@ -862,18 +869,20 @@ proc decideAll*(
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order. Genuine scripted seats run
   ## deterministically; LLM seats are retried once on failure and raise
-  ## PlayerFailureError rather than substituting a scripted fallback.
+  ## InfraFailureError (for provider/transport/credential errors) or
+  ## PlayerFailureError (for unparseable/illegal model replies) rather than
+  ## substituting a scripted fallback.
   result = newSeq[Decision](seats.len)
   var open: seq[int]
   var lastError: array[Seats, string]
+  var lastIsInfra: array[Seats, bool]
   for index, seat in seats:
     let kind = scriptedKinds[seat]
     if kind != skNone:
       result[index] = scriptedDecision(sim, seat, kind, sim.inMeeting)
       result[index].source = dsScripted
     elif client == nil or client.disabled:
-      raisePlayerFailure(seat,
-        "LLM client disabled or missing credentials for seat " & $seat)
+      raiseInfraFailure("LLM client disabled or missing credentials")
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -905,19 +914,34 @@ proc decideAll*(
         decision.source = if attempt == 0: dsLlm else: dsRetry
         decision.latencyMs = latency
         result[index] = decision
+      except InfraFailureError as error:
+        let detail = cleanText(error.msg, MaxErrorLen)
+        lastError[seat] = detail
+        lastIsInfra[seat] = true
+        echo "hidden-agenda llm: seat ", seat, " attempt ", attempt + 1,
+          " infra failure: ", detail
+        stillOpen.add(index)
       except CatchableError as error:
         let detail = cleanText(error.msg, MaxErrorLen)
         lastError[seat] = detail
+        lastIsInfra[seat] = false
         echo "hidden-agenda llm: seat ", seat, " attempt ", attempt + 1,
           " failed: ", detail
         stillOpen.add(index)
     open = stillOpen
   if open.len > 0:
+    for index in open:
+      let seat = seats[index]
+      if lastIsInfra[seat]:
+        let detail =
+          if lastError[seat].len > 0: lastError[seat]
+          else: "LLM provider/infrastructure failure"
+        raiseInfraFailure(detail)
     let seat = seats[open[0]]
     let detail =
       if lastError[seat].len > 0: lastError[seat]
       else: "LLM decision failed"
-    raisePlayerFailure(seat, "seat " & $seat & " decision failed: " & detail)
+    raisePlayerFailure(seat, "seat " & $seat & " rejected action: " & detail)
 
 # ---------------------------------------------------------------------------
 # The decision driver: the batch cadence, the wall-clock floor, the batch cap
@@ -938,8 +962,6 @@ type
     deadline*: float
     clock*: proc (): float {.closure.}
     sleeper*: proc (seconds: float) {.closure.}
-    previous*: array[Seats, Decision]
-    hasPrevious*: array[Seats, bool]
     deadlineHit*: bool
     batchSizes*: seq[int]
 
@@ -973,24 +995,24 @@ proc decide*(driver: DecisionDriver, sim: var Sim, seats: seq[int],
   if seats.len == 0:
     return @[]
   result = newSeq[Decision](seats.len)
-  ## Budget cap: after the last permitted batch every subsequent meeting
-  ## reuses each seat's PREVIOUS decision, recorded as source "budget".
+  var hasModelSeat = false
+  for seat in seats:
+    if driver.scriptedKinds[seat] == skNone:
+      hasModelSeat = true
+      break
   if driver.batches >= driver.maxBatches or driver.pastDeadline():
     if driver.pastDeadline():
       driver.deadlineHit = true
+    if hasModelSeat:
+      if driver.pastDeadline():
+        raiseInfraFailure("play deadline reached at decision point")
+      raiseInfraFailure("decision batch limit (" & $driver.maxBatches &
+        ") reached before episode completed")
     for index, seat in seats:
-      let kind = driver.scriptedKinds[seat]
-      if kind != skNone:
-        result[index] = scriptedDecision(sim, seat, kind, sim.inMeeting)
-        result[index].source = dsScripted
-        result[index].latencyMs = 0
-      elif driver.hasPrevious[seat]:
-        result[index] = driver.previous[seat]
-        result[index].source = dsBudget
-        result[index].latencyMs = 0
-      else:
-        raisePlayerFailure(seat,
-          "decision budget exhausted with no previous decision for seat " & $seat)
+      result[index] = scriptedDecision(sim, seat, driver.scriptedKinds[seat],
+        sim.inMeeting)
+      result[index].source = dsScripted
+      result[index].latencyMs = 0
     return
   ## `minBatchSeconds` floors the spacing between batch STARTS, so the episode
   ## stays under the Bedrock sidecar's 30 rpm per-episode ceiling (raid,
@@ -1006,6 +1028,3 @@ proc decide*(driver: DecisionDriver, sim: var Sim, seats: seq[int],
   driver.batchSizes.add(seats.len)
   result = decideAll(driver.client, sim, seats, driver.prompts,
     driver.scriptedKinds, cause, driver.selection)
-  for index, seat in seats:
-    driver.previous[seat] = result[index]
-    driver.hasPrevious[seat] = true

@@ -297,14 +297,14 @@ block disabledClientFailsPromptSeatsButAllowsScriptedSeats:
   for decision in scripted:
     check(decision.source == dsScripted,
       "genuine scripted seats still run without LLM credentials")
-  var failedSlot = -1
+  var infraRaised = false
   try:
     discard client.decideAll(sim, seats, prompts, llmKinds, "opening",
       PromptSelection())
-  except PlayerFailureError as err:
-    failedSlot = err.slot
-  check(failedSlot == 0,
-    "prompt seat without LLM credentials raises PlayerFailureError instead of falling back")
+  except InfraFailureError:
+    infraRaised = true
+  check(infraRaised,
+    "prompt seat without LLM credentials raises InfraFailureError instead of blaming a player or falling back")
 
 block minBatchSecondsFloorsTheSpacing:
   var sim = rig()
@@ -346,11 +346,14 @@ block maxDecisionBatchesCaps:
   for round in 0 ..< 3:
     discard driver.decide(sim, seats, "meeting")
   check(driver.batchSizes.len == 3, "three batches were issued")
-  let after = driver.decide(sim, seats, "meeting")
+  var infraRaised = false
+  try:
+    discard driver.decide(sim, seats, "meeting")
+  except InfraFailureError:
+    infraRaised = true
   check(driver.batchSizes.len == 3, "and never a fourth")
-  for decision in after:
-    check(decision.source == dsBudget,
-      "past the cap every seat reuses its previous decision as \"budget\"")
+  check(infraRaised,
+    "past the cap non-scripted seats raise InfraFailureError instead of reusing stale previous moves")
 
 block theDeadlineSettlesEarly:
   var config = baseConfig(4)
@@ -452,7 +455,7 @@ block theRetryBatchAndTheFallbackAreDriven:
         $decision.source)
       check(decision.plan.len >= 1, "and is a legal plan")
 
-  ## (2) A 429 on both attempts: two batches, then PlayerFailureError (no fallback).
+  ## (2) A 429 on both attempts: two batches, then InfraFailureError (no fallback, no player blame).
   block:
     var sim = rig()
     var batches = 0
@@ -468,17 +471,17 @@ block theRetryBatchAndTheFallbackAreDriven:
       prompts.add("play well")
       kinds.add(skNone)
     let seats = sim.activeSeats()
-    var failedSlot = -1
+    var infraRaised = false
     try:
       discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
-    except PlayerFailureError as err:
-      failedSlot = err.slot
+    except InfraFailureError:
+      infraRaised = true
     check(batches == 2, "a 429 is retried once and then fails, got " &
       $batches & " batches")
-    check(failedSlot == 0,
-      "exhausted 429 raises PlayerFailureError instead of falling back")
+    check(infraRaised,
+      "exhausted 429 raises InfraFailureError instead of blaming a player or falling back")
 
-  ## (3) A 403 disables the client outright: one batch, raises PlayerFailureError,
+  ## (3) A 403 disables the client outright: one batch, raises InfraFailureError,
   ## and every LATER decision point also fails immediately without issuing a batch.
   block:
     var sim = rig()
@@ -495,21 +498,21 @@ block theRetryBatchAndTheFallbackAreDriven:
       prompts.add("play well")
       kinds.add(skNone)
     let seats = sim.activeSeats()
-    var failedSlot = -1
+    var infraRaised = false
     try:
       discard client.decideAll(sim, seats, prompts, kinds, "opening", PromptSelection())
-    except PlayerFailureError as err:
-      failedSlot = err.slot
+    except InfraFailureError:
+      infraRaised = true
     check(batches == 1, "a 403 stops the ladder inside the first batch")
     check(client.disabled, "and disables the client")
-    check(failedSlot == 0, "and raises PlayerFailureError")
-    failedSlot = -1
+    check(infraRaised, "and raises InfraFailureError")
+    infraRaised = false
     try:
       discard client.decideAll(sim, seats, prompts, kinds, "meeting", PromptSelection())
-    except PlayerFailureError as err:
-      failedSlot = err.slot
+    except InfraFailureError:
+      infraRaised = true
     check(batches == 1, "a disabled client never issues another batch")
-    check(failedSlot == 0, "and raises PlayerFailureError on later calls")
+    check(infraRaised, "and raises InfraFailureError on later calls")
 
   ## (4) Junk that is not JSON at all, twice: two batches, then PlayerFailureError.
   block:
