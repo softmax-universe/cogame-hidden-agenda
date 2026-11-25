@@ -48,8 +48,9 @@ game actions:
 
 The game sends `observation` only at a decision point for an active seat. The
 `id` pairs the action with that decision point. The game validates the action
-with the same plan and vote rules used for prompt policies. A missing action
-uses the miner baseline. The game owns results and replay for every policy.
+with the same plan and vote rules used for prompt policies. A rejected or
+missing action declares a player failure and settles the episode as `forfeit`.
+The game owns results and replay for every policy.
 
 ## Routes
 
@@ -68,9 +69,9 @@ uses the miner baseline. The game owns results and replay for every policy.
 contacts nothing but S3 for the `.replay` file. No pod path serves a replay page.
 
 Startup randomises the seed **before** `config.update`, waits up to
-`playerConnectTimeoutSeconds = 120` for the five sockets, starts anyway with
-whoever is there (a missing seat plays `miner`; **no** seat present →
-`forfeit`), then runs the tick loop.
+`playerConnectTimeoutSeconds = 120` for all five sockets to connect and
+register, declares a player failure and settles `forfeit` if any seat fails to
+register, and otherwise runs the tick loop.
 
 Shutdown, in order: `final` to all five sockets → the last global frame →
 `sleep 500 ms` → `results.json` → the replay → keep `/healthz` and `/global`

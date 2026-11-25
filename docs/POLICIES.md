@@ -14,8 +14,8 @@ coworld upload-policy coworld-hidden-agenda:latest \
 ```
 
 `USE_BEDROCK=true` is not optional for an LLM policy: the platform gates the
-player pod's Bedrock sidecar on it, and without it the seat silently plays
-scripted.
+player pod's Bedrock sidecar on it, and without LLM credentials a prompt seat
+fails and forfeits the episode.
 
 A scripted baseline is the same image with a different env:
 
@@ -84,7 +84,9 @@ only while a meeting is open.
 
 ## What you reply with
 
-Exactly one JSON object whose first character is `{`.
+Exactly one JSON object, either bare or inside a single ordinary outer Markdown
+code fence (plain or `json`-tagged). Surrounding prose or extra JSON objects are
+rejected.
 
 ```json
 {"plan":[{"job":"mine","at":"S5"},{"job":"deposit"},{"job":"watch","who":"PINK"}],
@@ -102,26 +104,23 @@ Exactly one JSON object whose first character is `{`.
 | `plan[].who` | enum | an alias `active` **now** | required for `watch`/`hunt`/`strike` |
 | `plan[].room` | enum | `NW` `N` `NE` `SW` `S` `SE` `HUB` | required for `patrol`/`lurk` |
 | `vote` | enum | an active alias, or `"skip"` | **required at a meeting** |
-| `switch` | object or null | `{"if": <alias>\|"tie", "to": <alias>\|"skip"}` | naming an inactive cog → invalid; missing one of the two keys → no conditional |
+| `switch` | object or null | `{"if": <alias>\|"tie", "to": <alias>\|"skip"}` | omitted or `null` = no conditional; an object missing `"if"` or `"to"` or naming an inactive cog → invalid |
 | `say` | string | **90 chars**, truncated | chat variant only; ignored elsewhere |
 | `hunch` | string | **80 chars**, truncated | spectator-only |
 | `notes` | string | **240 chars**, truncated | private to you |
 
-Extra keys are ignored. Truncation is on **rune** boundaries. A step's argument
-may also be written compactly inside `job` — `{"job":"mine at:S2"}` is read as
-`{"job":"mine","at":"S2"}`, and likewise `watch who:`, `patrol room:`,
-`hunt who:`, `strike who:`, `lurk room:` — because that is the form the system
-prompt teaches. The sibling key wins when both are present.
+Extra keys are ignored. Truncation is on **rune** boundaries. Each plan step
+must place its argument (`at`, `who`, `room`) in the sibling JSON key alongside
+`"job"`.
 
-An invalid reply is retried **once** in the same decision point's batch with a
-hint. Still failing → that seat plays the `miner` decision for that decision
-point, recorded on the `order` event as `"source":"fallback"`. `decideAll` never
-raises; the episode always advances.
+An invalid prompt-policy reply is retried **once** in the same decision point's
+batch with a hint. Still failing — or an invalid/missing external action —
+records a player failure (`COGAME_PLAYER_FAILURE_URI`) and settles the episode
+as `forfeit` with post-game results and replay written.
 
 ## The scripted baselines
 
-**`miner`** — the working baseline, and the fallback every failed LLM decision
-lands on. As crew it chains `mine` → `deposit` → `watch` on whoever it has gone
+**`miner`** — the working baseline. As crew it chains `mine` → `deposit` → `watch` on whoever it has gone
 longest without seeing, and votes a deterministic suspicion score (a witnessed
 freeze is worth 20, a body in someone's last-seen room 3, a fake deposit it
 personally saw 6, plus one per hundred ticks unseen), voting `skip` under 6. As

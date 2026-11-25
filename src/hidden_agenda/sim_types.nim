@@ -67,6 +67,8 @@ proc oneLine*(text: string, limit: int): string =
 
 type
   HiddenAgendaError* = object of CatchableError
+  PlayerFailureError* = object of HiddenAgendaError
+    slot*: int
 
   Facing* = enum
     fN = "N", fE = "E", fS = "S", fW = "W"
@@ -97,7 +99,6 @@ type
 
   DecisionSource* = enum
     dsLlm = "llm", dsExternal = "external", dsRetry = "retry",
-    dsFallback = "fallback"
     dsScripted = "scripted", dsBudget = "budget"
 
   Decision* = object

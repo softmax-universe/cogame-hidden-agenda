@@ -1,6 +1,5 @@
 ## The two scripted baselines, both role-aware, both fieldable, both league
-## fillers: `miner` (the working baseline, and the fallback every failed LLM
-## decision lands on) and `lurker` (the foil).
+## fillers: `miner` (the working baseline) and `lurker` (the foil).
 ##
 ## New module, replacing paintbot's `src/ctf/baselines.nim`. A baseline decides
 ## purely from its OWN observation at each decision point — no shared state and
@@ -17,8 +16,8 @@ type
 
 proc parseScriptKind*(text: string): ScriptKind =
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "miner": skMiner
-  of "lurker", "lurk": skLurker
+  of "miner": skMiner
+  of "lurker": skLurker
   else: skNone
 
 # ---------------------------------------------------------------------------

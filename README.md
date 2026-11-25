@@ -44,9 +44,11 @@ deterministic kernel walks them for you until the next meeting.
  "notes":"red has been in NW since 640"}
 ```
 
-Crew jobs: `mine at:<seam>` `deposit` `watch who:<alias>` `patrol room:<room>`
-`guard` `hold`. The impostor gets those six plus `hunt who:<alias>`
-`strike who:<alias>` `lurk room:<room>`.
+Crew jobs: `{"job":"mine","at":"<seam>"}`, `{"job":"deposit"}`,
+`{"job":"watch","who":"<alias>"}`, `{"job":"patrol","room":"<room>"}`,
+`{"job":"guard"}`, `{"job":"hold"}`. The impostor gets those six plus
+`{"job":"hunt","who":"<alias>"}`, `{"job":"strike","who":"<alias>"}`,
+`{"job":"lurk","room":"<room>"}`.
 
 Full rules: [docs/RULES.md](docs/RULES.md). Wire formats:
 [docs/PROTOCOL.md](docs/PROTOCOL.md). Fielding a policy:
