@@ -182,7 +182,7 @@ block resultsSchema:
   var endings: seq[string]
   for row in schema{"properties"}{"ending"}{"enum"}:
     endings.add(row.getStr())
-  check(endings.len == 6, "six legal endings")
+  check(endings.len == 5, "five legal endings")
   for ending in ["crew_deposits", "impostor_ejected", "impostor_isolation",
       "timeout", "deadline"]:
     check(ending in endings, ending & " must be a legal ending")
